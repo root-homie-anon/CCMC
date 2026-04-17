@@ -1,0 +1,18 @@
+# Binary (root only, not cmd/ccmc/ or pkg/ccmc/)
+/ccmc
+
+# Environment
+.env
+.env.local
+
+# State (runtime, gitignored)
+state/
+
+# CCMC local data
+.ccmc/
+
+# OS
+.DS_Store
+
+# Go
+vendor/
