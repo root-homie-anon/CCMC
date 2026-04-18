@@ -152,3 +152,32 @@ func decodeProjectDir(encoded string) string {
 	// Reverse: replace all "-" with "/"
 	return strings.ReplaceAll(encoded, "-", "/")
 }
+
+// FindSessionJSONL searches all project directories under ~/.claude/projects/
+// for a JSONL file matching the given sessionID. Returns the absolute path to
+// the JSONL file and the decoded project path, or ("", "", nil) when not found.
+// Returns ("", "", err) only for unexpected I/O errors.
+func FindSessionJSONL(sessionID string) (jsonlPath, projectPath string, err error) {
+	projectsDir := config.ClaudeProjectsDir()
+	entries, err := os.ReadDir(projectsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", "", nil
+		}
+		return "", "", err
+	}
+
+	target := sessionID + ".jsonl"
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		candidate := filepath.Join(projectsDir, entry.Name(), target)
+		if _, statErr := os.Stat(candidate); statErr == nil {
+			return candidate, decodeProjectDir(entry.Name()), nil
+		}
+	}
+
+	return "", "", nil
+}
