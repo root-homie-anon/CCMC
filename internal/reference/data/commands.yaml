@@ -1,0 +1,283 @@
+- name: /clear
+  category: commands
+  description: Clears the current conversation context, starting a fresh context window while keeping the session running.
+  usage: /clear
+  examples:
+    - "/clear"
+  related:
+    - /compact
+    - /status
+  gotchas:
+    - "All conversation history is discarded — context cannot be recovered after /clear."
+    - "Does not close the session or affect the daemon registry; the session remains tracked."
+
+- name: /compact
+  category: commands
+  description: Compacts the current conversation by summarizing prior context into a condensed form, reducing token usage while preserving key information.
+  usage: /compact [instructions]
+  examples:
+    - "/compact"
+    - "/compact focus on the database migration work only"
+  related:
+    - /clear
+    - /status
+  gotchas:
+    - "Compaction is lossy — fine-grained tool call details and exact message text are not preserved in the summary."
+    - "Fires the PreCompact hook event before compacting; hooks can block or modify compaction behavior."
+    - "Optional instructions argument lets you bias what the summary preserves."
+
+- name: /init
+  category: commands
+  description: Initializes a CLAUDE.md file in the current project directory, scaffolding project memory and instructions for future sessions.
+  usage: /init
+  examples:
+    - "/init"
+  related:
+    - /config
+    - /status
+  gotchas:
+    - "Will not overwrite an existing CLAUDE.md — run only in projects that don't have one."
+    - "The generated file is a starting template; review and customize it before relying on it."
+
+- name: /model
+  category: commands
+  description: Displays or changes the AI model used for the current session.
+  usage: /model [model-name]
+  examples:
+    - "/model"
+    - "/model claude-opus-4-5"
+    - "/model claude-sonnet-4-6"
+  related:
+    - /status
+    - /cost
+  gotchas:
+    - "Model change takes effect immediately for the next turn; current context is preserved."
+    - "Using a less capable model mid-session may degrade results on complex ongoing tasks."
+    - "Model names must be exact — invalid names produce an error."
+
+- name: /cost
+  category: commands
+  description: Shows the token usage and estimated cost for the current session.
+  usage: /cost
+  examples:
+    - "/cost"
+  related:
+    - /status
+    - /model
+    - /compact
+  gotchas:
+    - "Cost estimate is approximate; actual billing may differ based on cache hits and pricing tier."
+    - "Resets when you use /clear — cost display only covers the current context window."
+
+- name: /permissions
+  category: commands
+  description: Displays and manages tool permission rules for the current session, including which tools are allowed or denied without prompting.
+  usage: /permissions
+  examples:
+    - "/permissions"
+  related:
+    - /config
+    - /hooks
+  gotchas:
+    - "Permission rules are layered: user settings override project settings, which override defaults."
+    - "Changes made interactively through this command apply to the current session scope unless saved."
+
+- name: /config
+  category: commands
+  description: Opens the Claude Code configuration editor, allowing you to view and modify settings such as theme, model defaults, and behavior options.
+  usage: /config
+  examples:
+    - "/config"
+  related:
+    - /permissions
+    - /hooks
+    - /theme
+  gotchas:
+    - "Config changes are written to settings.json; always back up settings.json before bulk edits."
+    - "Some config fields require a session restart to take effect."
+
+- name: /hooks
+  category: commands
+  description: Displays currently configured lifecycle hooks and their event bindings for the active session scope.
+  usage: /hooks
+  examples:
+    - "/hooks"
+  related:
+    - /config
+    - /permissions
+  gotchas:
+    - "Shows hooks from all scopes (user + project) merged; the source scope is not always indicated."
+    - "Hook configuration changes must be made directly in settings.json — this command is read-only."
+
+- name: /mcp
+  category: commands
+  description: Lists connected MCP (Model Context Protocol) servers and their exposed tools for the current session.
+  usage: /mcp
+  examples:
+    - "/mcp"
+  related:
+    - /config
+    - /permissions
+  gotchas:
+    - "Only shows MCP servers that are connected and responding — servers configured but not running will not appear."
+    - "MCP server tool names shown here are what you use in permission allow/deny rules."
+
+- name: /agents
+  category: commands
+  description: Lists available subagents (defined in .claude/agents/ or ~/.claude/agents/) that can be invoked in the current session.
+  usage: /agents
+  examples:
+    - "/agents"
+  related:
+    - /mcp
+    - /config
+  gotchas:
+    - "Only agents discoverable from the current project scope and global scope are listed."
+    - "Agent availability can change if .claude/agents/ files are added or removed mid-session."
+
+- name: /diff
+  category: commands
+  description: Shows a diff of files modified during the current session, scoped to changes Claude has made.
+  usage: /diff
+  examples:
+    - "/diff"
+  related:
+    - /status
+  gotchas:
+    - "Only shows changes tracked within the current context window — changes made before /clear are not included."
+    - "Requires the project to be a git repository; non-git projects may show limited or no output."
+
+- name: /vim
+  category: commands
+  description: Toggles Vim keybindings mode for the input prompt, enabling modal editing (normal/insert/visual modes).
+  usage: /vim
+  examples:
+    - "/vim"
+  related:
+    - /terminal-setup
+    - /config
+  gotchas:
+    - "Vim mode is a session-level toggle; it does not persist across sessions unless set in config."
+    - "Not all Vim motions are implemented — complex macros and ex commands are not supported."
+
+- name: /theme
+  category: commands
+  description: Changes the color theme for the Claude Code terminal UI.
+  usage: /theme [theme-name]
+  examples:
+    - "/theme"
+    - "/theme dark"
+    - "/theme light"
+  related:
+    - /config
+    - /terminal-setup
+  gotchas:
+    - "Theme applies immediately but is only persisted if saved via /config."
+    - "Terminal color support varies; some themes may render poorly in terminals with limited color support."
+
+- name: /terminal-setup
+  category: commands
+  description: Runs an interactive setup to configure terminal integration, including font, color, and shell completion settings for Claude Code.
+  usage: /terminal-setup
+  examples:
+    - "/terminal-setup"
+  related:
+    - /theme
+    - /config
+    - /doctor
+  gotchas:
+    - "Modifies shell profile files; review changes before confirming if you have custom shell configuration."
+    - "Some steps require a shell restart or new terminal window to take effect."
+
+- name: /doctor
+  category: commands
+  description: Runs a diagnostic check of the Claude Code environment, verifying configuration, connectivity, permissions, and known issues.
+  usage: /doctor
+  examples:
+    - "/doctor"
+  related:
+    - /status
+    - /terminal-setup
+    - /upgrade
+  gotchas:
+    - "Doctor checks are read-only — it diagnoses but does not auto-fix issues."
+    - "Network connectivity checks require outbound access; results may be misleading behind restrictive firewalls."
+
+- name: /status
+  category: commands
+  description: Shows the current session status, including model, context usage, active subagents, and session metadata.
+  usage: /status
+  examples:
+    - "/status"
+  related:
+    - /cost
+    - /model
+    - /doctor
+  gotchas:
+    - "Context usage shown is an estimate; actual token count may differ slightly from the display."
+
+- name: /desktop
+  category: commands
+  description: Launches or toggles the Claude Code desktop companion view, providing a graphical overview of the current session.
+  usage: /desktop
+  examples:
+    - "/desktop"
+  related:
+    - /status
+    - /config
+  gotchas:
+    - "Requires a compatible desktop environment; not available in pure SSH or headless terminal sessions."
+
+- name: /upgrade
+  category: commands
+  description: Upgrades Claude Code to the latest available version.
+  usage: /upgrade
+  examples:
+    - "/upgrade"
+  related:
+    - /doctor
+    - /status
+  gotchas:
+    - "Upgrade replaces the running binary; the current session must be restarted to use the new version."
+    - "Requires network access to the Claude Code distribution endpoint."
+    - "Not available in air-gapped or enterprise-locked installations where upgrades are managed separately."
+
+- name: /logout
+  category: commands
+  description: Logs out of the current Claude Code session, clearing authentication credentials from the local credential store.
+  usage: /logout
+  examples:
+    - "/logout"
+  related:
+    - /config
+    - /status
+  gotchas:
+    - "Clears stored credentials — you will need to re-authenticate before starting a new session."
+    - "Does not terminate any running background daemons or subagents; those continue until explicitly stopped."
+
+- name: /bug
+  category: commands
+  description: Opens the Claude Code bug reporting flow, pre-filling a report with session context, model info, and relevant diagnostics.
+  usage: /bug
+  examples:
+    - "/bug"
+  related:
+    - /doctor
+    - /status
+  gotchas:
+    - "Session context included in the bug report may contain project file paths and recent conversation snippets — review before submitting."
+    - "Requires network access to submit the report to Anthropic."
+
+- name: /help
+  category: commands
+  description: Displays help information for Claude Code commands, showing available commands and their descriptions.
+  usage: /help [command]
+  examples:
+    - "/help"
+    - "/help /compact"
+    - "/help /hooks"
+  related:
+    - /status
+    - /doctor
+  gotchas:
+    - "Help text reflects the installed version — if you have recently upgraded, help may not yet reflect the latest changes until the session is restarted."
