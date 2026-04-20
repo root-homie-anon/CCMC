@@ -1,0 +1,1292 @@
+- name: SessionStart
+  category: hooks
+  description: Fires once when a Claude Code session is initialized, before the first user prompt is processed.
+  usage: ""
+  examples:
+    - "matcher: {}"
+    - "matcher: { project: \"/Users/me/myproject\" }"
+  related:
+    - SessionEnd
+    - Setup
+  gotchas:
+    - "Fires before any user input — environment setup scripts must be fast to avoid blocking the session."
+    - "The sessionId in the payload is the canonical ID used for all subsequent events in this session."
+    - "Non-zero exit from a blocking handler aborts session startup."
+  detail: |
+    ## When it fires
+    Once per session, immediately after the CC process starts and the session ID is assigned, before the first user prompt is shown or processed.
+
+    ## Available matchers
+    - `project` — match by absolute project directory path
+    - `session_id` — match by session ID (rarely useful at start)
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command executed as a subprocess
+    - `http` — HTTP POST to a URL (async or blocking per `wait` flag)
+
+    ## Exit code behavior
+    - `0` — success, session continues
+    - Non-zero — aborts session startup if handler is blocking (`wait: true`); ignored if async
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "SessionStart": [
+          {
+            "matcher": {},
+            "hooks": [
+              {
+                "type": "command",
+                "command": "echo Session started >> ~/.ccmc/session.log",
+                "wait": false
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: SessionEnd
+  category: hooks
+  description: Fires when a Claude Code session terminates, either by user exit or process shutdown.
+  usage: ""
+  examples:
+    - "matcher: {}"
+    - "matcher: { project: \"/Users/me/myproject\" }"
+  related:
+    - SessionStart
+    - Stop
+  gotchas:
+    - "Not guaranteed to fire if the process is killed with SIGKILL — only fires on clean shutdown."
+    - "Payload includes the session summary extracted from the final Stop event if available."
+    - "Async handlers may not complete before the process exits — prefer synchronous cleanup."
+  detail: |
+    ## When it fires
+    When the CC session terminates cleanly — user types `/exit`, hits Ctrl+C, or the process shuts down gracefully.
+
+    ## Available matchers
+    - `project` — match by absolute project directory path
+    - `session_id` — match by session ID
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "timestamp": "string (ISO 8601)",
+      "duration_seconds": "number"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command executed as a subprocess
+    - `http` — HTTP POST to a URL
+
+    ## Exit code behavior
+    - Exit code is ignored — session is already ending regardless
+    - Use `wait: true` if cleanup must complete before the process exits
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "SessionEnd": [
+          {
+            "matcher": {},
+            "hooks": [
+              {
+                "type": "http",
+                "url": "http://localhost:7891/hooks/session-end",
+                "wait": false
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: PreToolUse
+  category: hooks
+  description: Fires before any tool call is executed, allowing inspection or blocking of the tool use.
+  usage: ""
+  examples:
+    - "matcher: { tool_name: \"Bash\" }"
+    - "matcher: { tool_name: \"Write\" }"
+    - "matcher: {}"
+  related:
+    - PostToolUse
+    - PostToolUseFailure
+    - PermissionRequest
+  gotchas:
+    - "Blocking this event (non-zero exit) prevents the tool call from executing — use carefully."
+    - "The full tool input is available in the payload — inspect it to decide whether to allow."
+    - "Runs synchronously; slow handlers add latency to every tool call."
+  detail: |
+    ## When it fires
+    Immediately before Claude executes any tool call, after the permission check passes but before the tool runs.
+
+    ## Available matchers
+    - `tool_name` — match by tool name (e.g. `Bash`, `Write`, `Edit`, `Read`, `Glob`, `Grep`, `Agent`)
+    - `project` — match by absolute project directory path
+    - `session_id` — match by session ID
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "tool_name": "string",
+      "tool_input": "object (tool-specific, matches tool's parameter schema)",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command; stdout can optionally modify tool input (with `modify_input: true`)
+    - `http` — HTTP POST; response body can optionally modify tool input
+
+    ## Exit code behavior
+    - `0` — tool call proceeds normally
+    - Non-zero — tool call is blocked; CC receives an error result for the tool use
+    - Output to stdout (when `modify_input: true`) replaces the tool input JSON
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "PreToolUse": [
+          {
+            "matcher": { "tool_name": "Bash" },
+            "hooks": [
+              {
+                "type": "command",
+                "command": "bash ~/.claude/hooks/audit-bash.sh",
+                "wait": true
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: PostToolUse
+  category: hooks
+  description: Fires after a tool call completes successfully, with both the input and output available.
+  usage: ""
+  examples:
+    - "matcher: { tool_name: \"Write\" }"
+    - "matcher: { tool_name: \"Edit\" }"
+    - "matcher: {}"
+  related:
+    - PreToolUse
+    - PostToolUseFailure
+  gotchas:
+    - "The tool output may be large for tools like Read or Bash — avoid logging the full payload in high-frequency scenarios."
+    - "Runs after the tool has already executed — cannot block or modify the result."
+    - "Fires for every successful tool use, including internal agent tool calls."
+  detail: |
+    ## When it fires
+    Immediately after a tool call returns a successful result, before Claude processes the result.
+
+    ## Available matchers
+    - `tool_name` — match by tool name (e.g. `Write`, `Edit`, `Bash`, `Read`)
+    - `project` — match by absolute project directory path
+    - `session_id` — match by session ID
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "tool_name": "string",
+      "tool_input": "object (tool-specific)",
+      "tool_output": "object or string (tool-specific result)",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command executed after the tool completes
+    - `http` — HTTP POST to a URL
+
+    ## Exit code behavior
+    - Exit code is ignored — tool has already completed successfully
+    - Use for side effects: logging, registry updates, notifications
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "PostToolUse": [
+          {
+            "matcher": { "tool_name": "Write" },
+            "hooks": [
+              {
+                "type": "http",
+                "url": "http://localhost:7891/hooks/post-tool-use",
+                "wait": false
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: PostToolUseFailure
+  category: hooks
+  description: Fires after a tool call fails or returns an error result, with the error details available.
+  usage: ""
+  examples:
+    - "matcher: { tool_name: \"Bash\" }"
+    - "matcher: {}"
+  related:
+    - PostToolUse
+    - PreToolUse
+  gotchas:
+    - "Fires on tool errors, not permission denials — PermissionRequest fires for those."
+    - "Cannot retry the tool call from this hook — informational only."
+    - "The error field contains the tool's error message or exit code details."
+  detail: |
+    ## When it fires
+    After a tool call returns an error result (e.g. Bash exits non-zero, Write fails due to permissions, Read fails file not found).
+
+    ## Available matchers
+    - `tool_name` — match by tool name
+    - `project` — match by absolute project directory path
+    - `session_id` — match by session ID
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "tool_name": "string",
+      "tool_input": "object (tool-specific)",
+      "error": "string",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command for logging or alerting
+    - `http` — HTTP POST to a URL
+
+    ## Exit code behavior
+    - Exit code is ignored — informational event only
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "PostToolUseFailure": [
+          {
+            "matcher": {},
+            "hooks": [
+              {
+                "type": "command",
+                "command": "echo Tool failure >> ~/.ccmc/errors.log",
+                "wait": false
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: PermissionRequest
+  category: hooks
+  description: Fires when Claude requests permission to use a tool that requires user approval, before the approval dialog is shown.
+  usage: ""
+  examples:
+    - "matcher: { tool_name: \"Bash\" }"
+    - "matcher: {}"
+  related:
+    - PreToolUse
+    - PostToolUse
+  gotchas:
+    - "A non-zero exit or explicit deny response from this hook auto-denies the permission without prompting the user."
+    - "Can auto-approve permissions programmatically — use with caution in automated contexts."
+    - "Only fires for tools not already covered by allow/deny rules in settings.json."
+  detail: |
+    ## When it fires
+    When Claude attempts to use a tool that is not covered by an existing allow or deny rule, triggering the permission prompt flow.
+
+    ## Available matchers
+    - `tool_name` — match by tool name
+    - `project` — match by absolute project directory path
+    - `session_id` — match by session ID
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "tool_name": "string",
+      "tool_input": "object (tool-specific)",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — stdout `{"decision": "allow"}` or `{"decision": "deny"}` controls the outcome
+    - `http` — response body JSON with `decision` field
+
+    ## Exit code behavior
+    - `0` with no output — shows the normal permission dialog to the user
+    - `0` with `{"decision": "allow"}` on stdout — auto-approves without prompting
+    - Non-zero or `{"decision": "deny"}` — auto-denies without prompting
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "PermissionRequest": [
+          {
+            "matcher": { "tool_name": "Bash" },
+            "hooks": [
+              {
+                "type": "command",
+                "command": "bash ~/.claude/hooks/auto-approve-bash.sh",
+                "wait": true
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: UserPromptSubmit
+  category: hooks
+  description: Fires each time the user submits a prompt, before Claude processes it, allowing inspection or modification of the input.
+  usage: ""
+  examples:
+    - "matcher: {}"
+    - "matcher: { project: \"/Users/me/myproject\" }"
+  related:
+    - PreToolUse
+    - Stop
+  gotchas:
+    - "Can modify the prompt text by writing replacement text to stdout."
+    - "Non-zero exit blocks the prompt from being processed — use for content policy enforcement."
+    - "Fires on every user turn including follow-ups mid-conversation."
+  detail: |
+    ## When it fires
+    Each time the user submits a message — whether an initial prompt, a follow-up, or a response to a Claude question.
+
+    ## Available matchers
+    - `project` — match by absolute project directory path
+    - `session_id` — match by session ID
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "prompt": "string",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — stdout can replace the prompt text (when `modify_prompt: true`)
+    - `http` — response body can replace the prompt text
+
+    ## Exit code behavior
+    - `0` — prompt proceeds normally (or with stdout replacement if applicable)
+    - Non-zero — prompt is blocked; user sees an error and can retry
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "matcher": {},
+            "hooks": [
+              {
+                "type": "command",
+                "command": "bash ~/.claude/hooks/log-prompt.sh",
+                "wait": false
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: Stop
+  category: hooks
+  description: Fires when Claude finishes a response turn and stops generating, providing the final output and any tool use summary.
+  usage: ""
+  examples:
+    - "matcher: {}"
+    - "matcher: { project: \"/Users/me/myproject\" }"
+  related:
+    - StopFailure
+    - SessionEnd
+    - UserPromptSubmit
+  gotchas:
+    - "Fires after every response, not just at session end — it is high-frequency in active sessions."
+    - "The stop_reason field indicates why generation stopped: end_turn, max_tokens, tool_use, etc."
+    - "Task summaries and file-touched lists are most accurately built from this event."
+  detail: |
+    ## When it fires
+    After each assistant response completes — whether the response is a short answer, a long tool-calling sequence, or a partial response that ends due to token limits.
+
+    ## Available matchers
+    - `project` — match by absolute project directory path
+    - `session_id` — match by session ID
+    - `stop_reason` — match by stop reason value (`end_turn`, `max_tokens`, `tool_use`)
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "stop_reason": "string",
+      "response_summary": "string",
+      "tool_calls": ["array of tool_name strings used in this turn"],
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command for logging or state updates
+    - `http` — HTTP POST to a URL (used by CCMC daemon for session tracking)
+
+    ## Exit code behavior
+    - Exit code is ignored — informational event
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "Stop": [
+          {
+            "matcher": {},
+            "hooks": [
+              {
+                "type": "http",
+                "url": "http://localhost:7891/hooks/stop",
+                "wait": false
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: StopFailure
+  category: hooks
+  description: Fires when Claude's response generation fails with an error, such as a network timeout or API error.
+  usage: ""
+  examples:
+    - "matcher: {}"
+  related:
+    - Stop
+    - SessionEnd
+  gotchas:
+    - "Distinguishable from PostToolUseFailure — this is a generation-level failure, not a tool failure."
+    - "May fire multiple times if CC retries internally before giving up."
+    - "The error_type field helps distinguish API errors from local failures."
+  detail: |
+    ## When it fires
+    When a response generation attempt fails — API error, network timeout, rate limit, or other unrecoverable generation error.
+
+    ## Available matchers
+    - `project` — match by absolute project directory path
+    - `session_id` — match by session ID
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "error_type": "string",
+      "error_message": "string",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command for alerting or logging
+    - `http` — HTTP POST to a URL
+
+    ## Exit code behavior
+    - Exit code is ignored — informational event
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "StopFailure": [
+          {
+            "matcher": {},
+            "hooks": [
+              {
+                "type": "command",
+                "command": "echo Generation failed >> ~/.ccmc/errors.log",
+                "wait": false
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: SubagentStart
+  category: hooks
+  description: Fires when a subagent (spawned via the Agent or Task tool) starts, providing the subagent's identity and task.
+  usage: ""
+  examples:
+    - "matcher: {}"
+    - "matcher: { project: \"/Users/me/myproject\" }"
+  related:
+    - SubagentStop
+    - SessionStart
+  gotchas:
+    - "Subagents run in their own context but share the parent session ID for tracking."
+    - "Nested subagents (subagent spawning a subagent) each emit their own SubagentStart."
+    - "The agent_name may be empty for anonymous one-off agents spawned inline."
+  detail: |
+    ## When it fires
+    When the parent Claude session spawns a subagent using the Agent or Task tool, immediately before the subagent begins executing.
+
+    ## Available matchers
+    - `project` — match by absolute project directory path
+    - `session_id` — match by parent session ID
+    - `agent_name` — match by agent name (from .claude/agents/ frontmatter)
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "agent_id": "string",
+      "agent_name": "string",
+      "task_description": "string",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command for logging or registry updates
+    - `http` — HTTP POST to a URL (used by CCMC daemon to track active subagents)
+
+    ## Exit code behavior
+    - Exit code is ignored — informational event
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "SubagentStart": [
+          {
+            "matcher": {},
+            "hooks": [
+              {
+                "type": "http",
+                "url": "http://localhost:7891/hooks/subagent-start",
+                "wait": false
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: SubagentStop
+  category: hooks
+  description: Fires when a subagent finishes executing and returns control to the parent session.
+  usage: ""
+  examples:
+    - "matcher: {}"
+    - "matcher: { project: \"/Users/me/myproject\" }"
+  related:
+    - SubagentStart
+    - Stop
+  gotchas:
+    - "Fires regardless of whether the subagent completed successfully or errored."
+    - "The result field contains the subagent's final output or error message."
+    - "Pair with SubagentStart to measure subagent execution duration."
+  detail: |
+    ## When it fires
+    When a subagent finishes its task — whether successfully or with an error — and returns to the parent Claude session.
+
+    ## Available matchers
+    - `project` — match by absolute project directory path
+    - `session_id` — match by parent session ID
+    - `agent_name` — match by agent name
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "agent_id": "string",
+      "agent_name": "string",
+      "result": "string",
+      "success": "boolean",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command for logging or registry cleanup
+    - `http` — HTTP POST to a URL (used by CCMC daemon to update active subagent count)
+
+    ## Exit code behavior
+    - Exit code is ignored — informational event
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "SubagentStop": [
+          {
+            "matcher": {},
+            "hooks": [
+              {
+                "type": "http",
+                "url": "http://localhost:7891/hooks/subagent-stop",
+                "wait": false
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: PreCompact
+  category: hooks
+  description: Fires before Claude compacts the conversation context, allowing inspection or modification of the compaction instructions.
+  usage: ""
+  examples:
+    - "matcher: {}"
+  related:
+    - Stop
+    - UserPromptSubmit
+  gotchas:
+    - "Fired by both automatic compaction (context full) and manual /compact command."
+    - "Non-zero exit can block compaction — use sparingly, as blocking compaction risks context overflow."
+    - "The custom_instructions field is populated when the user ran /compact with arguments."
+  detail: |
+    ## When it fires
+    Immediately before Claude begins compacting the conversation — triggered by `/compact [instructions]` or automatically when context usage reaches the threshold.
+
+    ## Available matchers
+    - `project` — match by absolute project directory path
+    - `session_id` — match by session ID
+    - `trigger` — match by trigger type: `manual` (user ran /compact) or `automatic`
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "trigger": "string (manual | automatic)",
+      "custom_instructions": "string (empty if no /compact arguments)",
+      "context_tokens": "number",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — stdout can inject additional compaction instructions (appended to custom_instructions)
+    - `http` — response body can inject additional compaction instructions
+
+    ## Exit code behavior
+    - `0` — compaction proceeds (with any stdout instructions appended)
+    - Non-zero — compaction is blocked; session continues without compacting
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "PreCompact": [
+          {
+            "matcher": {},
+            "hooks": [
+              {
+                "type": "command",
+                "command": "cat ~/.claude/compact-instructions.txt",
+                "wait": true
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: Notification
+  category: hooks
+  description: Fires when Claude emits a notification event, such as requesting user attention or reporting a background status update.
+  usage: ""
+  examples:
+    - "matcher: {}"
+    - "matcher: { notification_type: \"attention_required\" }"
+  related:
+    - Stop
+    - SessionEnd
+  gotchas:
+    - "Notification types vary — inspect the notification_type field before acting."
+    - "Used by CCMC daemon as a general-purpose status channel for ambient session state updates."
+    - "Can fire multiple times per session turn."
+  detail: |
+    ## When it fires
+    When CC emits a notification — e.g. requesting user attention (waiting for input), reporting a long-running background operation, or signaling a status change.
+
+    ## Available matchers
+    - `project` — match by absolute project directory path
+    - `session_id` — match by session ID
+    - `notification_type` — match by notification type string
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "notification_type": "string",
+      "message": "string",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command for routing notifications (e.g. desktop alert, log entry)
+    - `http` — HTTP POST to a URL
+
+    ## Exit code behavior
+    - Exit code is ignored — informational event
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "Notification": [
+          {
+            "matcher": {},
+            "hooks": [
+              {
+                "type": "http",
+                "url": "http://localhost:7891/hooks/notification",
+                "wait": false
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: CwdChanged
+  category: hooks
+  description: Fires when the session's working directory changes, either via the user changing it or a tool operation that shifts the effective cwd.
+  usage: ""
+  examples:
+    - "matcher: {}"
+    - "matcher: { project: \"/Users/me/myproject\" }"
+  related:
+    - SessionStart
+    - ConfigChanged
+  gotchas:
+    - "The previous_cwd field lets you track directory traversal history."
+    - "Some tools (Bash with cd) may trigger this; others may not depending on how cwd is tracked."
+    - "Does not fire for cwd changes made inside a subagent — only the parent session's cwd is tracked."
+  detail: |
+    ## When it fires
+    When the effective working directory of the CC session changes — for example, when the user changes directory or when a tool operation shifts the context to a different project root.
+
+    ## Available matchers
+    - `project` — match by absolute project directory path (new cwd)
+    - `session_id` — match by session ID
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "previous_cwd": "string",
+      "new_cwd": "string",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command for logging or triggering project-switch logic
+    - `http` — HTTP POST to a URL
+
+    ## Exit code behavior
+    - Exit code is ignored — informational event
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "CwdChanged": [
+          {
+            "matcher": {},
+            "hooks": [
+              {
+                "type": "command",
+                "command": "echo CWD changed to $NEW_CWD >> ~/.ccmc/cwd.log",
+                "wait": false
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: FileChanged
+  category: hooks
+  description: Fires when a file in the project is modified by a tool (Write, Edit, MultiEdit), providing the file path and change type.
+  usage: ""
+  examples:
+    - "matcher: {}"
+    - "matcher: { tool_name: \"Write\" }"
+  related:
+    - PostToolUse
+    - CwdChanged
+  gotchas:
+    - "Fires per file, not per tool call — a MultiEdit touching 5 files emits 5 FileChanged events."
+    - "Read-only tool calls (Read, Grep, Glob) do not trigger this event."
+    - "The change_type field is: created, modified, or deleted."
+  detail: |
+    ## When it fires
+    After any file-modifying tool (Write, Edit, MultiEdit) successfully writes to disk, once per affected file.
+
+    ## Available matchers
+    - `project` — match by absolute project directory path
+    - `session_id` — match by session ID
+    - `tool_name` — match by the tool that caused the change
+    - `file_path` — match by the affected file path (glob pattern supported)
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "tool_name": "string",
+      "file_path": "string",
+      "change_type": "string (created | modified | deleted)",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command for file watchers, linters, or log entries
+    - `http` — HTTP POST to a URL
+
+    ## Exit code behavior
+    - Exit code is ignored — informational event (file is already written)
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "FileChanged": [
+          {
+            "matcher": { "file_path": "**/*.go" },
+            "hooks": [
+              {
+                "type": "command",
+                "command": "gofmt -w $FILE_PATH",
+                "wait": true
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: ConfigChanged
+  category: hooks
+  description: Fires when the CC configuration (settings.json or CLAUDE.md) is modified during a session.
+  usage: ""
+  examples:
+    - "matcher: {}"
+    - "matcher: { config_file: \"settings.json\" }"
+  related:
+    - InstructionsLoaded
+    - CwdChanged
+  gotchas:
+    - "Fires on both global (~/.claude/settings.json) and project (.claude/settings.json) changes."
+    - "Does not fire for external edits to config files — only edits made via CC commands or tools."
+    - "The config_file field identifies which file changed."
+  detail: |
+    ## When it fires
+    When CC detects a change to its configuration files — `settings.json` or `CLAUDE.md` — whether modified by a CC tool call or via a `/config` command.
+
+    ## Available matchers
+    - `project` — match by absolute project directory path
+    - `session_id` — match by session ID
+    - `config_file` — match by config file name (`settings.json`, `CLAUDE.md`)
+    - `scope` — match by scope (`global`, `project`)
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "config_file": "string",
+      "scope": "string (global | project)",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command for config validation or backup triggers
+    - `http` — HTTP POST to a URL
+
+    ## Exit code behavior
+    - Exit code is ignored — informational event
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "ConfigChanged": [
+          {
+            "matcher": { "config_file": "settings.json" },
+            "hooks": [
+              {
+                "type": "command",
+                "command": "cp ~/.claude/settings.json ~/.claude/settings.json.auto-bak",
+                "wait": false
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: InstructionsLoaded
+  category: hooks
+  description: Fires when CC loads or reloads CLAUDE.md instructions, providing the instruction source and content summary.
+  usage: ""
+  examples:
+    - "matcher: {}"
+    - "matcher: { scope: \"project\" }"
+  related:
+    - ConfigChanged
+    - SessionStart
+  gotchas:
+    - "Fires for both global (~/.claude/CLAUDE.md) and project (.claude/CLAUDE.md or CLAUDE.md) instruction files."
+    - "May fire multiple times per session if instructions are refreshed mid-session."
+    - "The scope field distinguishes which level of instruction file was loaded."
+  detail: |
+    ## When it fires
+    When CC loads CLAUDE.md instructions — at session start for all applicable scopes, and again if instructions are reloaded during the session.
+
+    ## Available matchers
+    - `project` — match by absolute project directory path
+    - `session_id` — match by session ID
+    - `scope` — match by scope (`global`, `project`)
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "scope": "string (global | project)",
+      "file_path": "string",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command for logging or instruction audit
+    - `http` — HTTP POST to a URL
+
+    ## Exit code behavior
+    - Exit code is ignored — informational event
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "InstructionsLoaded": [
+          {
+            "matcher": { "scope": "project" },
+            "hooks": [
+              {
+                "type": "command",
+                "command": "echo Project CLAUDE.md loaded >> ~/.ccmc/instructions.log",
+                "wait": false
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: TeammateIdle
+  category: hooks
+  description: Fires in a multi-agent team session when a teammate agent becomes idle (waiting for work or messages).
+  usage: ""
+  examples:
+    - "matcher: {}"
+    - "matcher: { agent_name: \"doug\" }"
+  related:
+    - SubagentStart
+    - SubagentStop
+    - TaskCompleted
+  gotchas:
+    - "Only fires in experimental agent team sessions (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1)."
+    - "Idle is distinct from stopped — a teammate goes idle between tasks but remains alive."
+    - "Use this event to trigger work dispatch to idle teammates."
+  detail: |
+    ## When it fires
+    In an agent team session, when a teammate agent completes its current task and enters an idle state, waiting to receive new work via SendMessage.
+
+    ## Available matchers
+    - `project` — match by absolute project directory path
+    - `session_id` — match by team session ID
+    - `agent_name` — match by teammate name (as set in TeamCreate)
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "agent_name": "string",
+      "agent_id": "string",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command for work dispatch logic
+    - `http` — HTTP POST to a URL
+
+    ## Exit code behavior
+    - Exit code is ignored — informational event
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "TeammateIdle": [
+          {
+            "matcher": {},
+            "hooks": [
+              {
+                "type": "command",
+                "command": "bash ~/.claude/hooks/dispatch-next-task.sh",
+                "wait": false
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: TaskCompleted
+  category: hooks
+  description: Fires when a task in the shared task list (used by agent teams) is marked as completed.
+  usage: ""
+  examples:
+    - "matcher: {}"
+    - "matcher: { project: \"/Users/me/myproject\" }"
+  related:
+    - TeammateIdle
+    - SubagentStop
+  gotchas:
+    - "Only fires in experimental agent team sessions (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1)."
+    - "The task_id field matches the ID assigned during TaskCreate."
+    - "Fires once per task completion, not once per agent that worked on it."
+  detail: |
+    ## When it fires
+    When a task in the team's shared task list is marked as completed — either by the agent working on it or by the orchestrator.
+
+    ## Available matchers
+    - `project` — match by absolute project directory path
+    - `session_id` — match by team session ID
+    - `agent_name` — match by the agent that completed the task
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "task_id": "string",
+      "task_title": "string",
+      "agent_name": "string",
+      "result": "string",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command for progress tracking or notifications
+    - `http` — HTTP POST to a URL
+
+    ## Exit code behavior
+    - Exit code is ignored — informational event
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "TaskCompleted": [
+          {
+            "matcher": {},
+            "hooks": [
+              {
+                "type": "command",
+                "command": "echo Task $TASK_ID completed >> ~/.ccmc/tasks.log",
+                "wait": false
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: Setup
+  category: hooks
+  description: Fires once during first-time CC setup or when ccmc setup is run, before the standard session lifecycle begins.
+  usage: ""
+  examples:
+    - "matcher: {}"
+  related:
+    - SessionStart
+    - ConfigChanged
+  gotchas:
+    - "Fires only during setup flows, not on every session start — do not confuse with SessionStart."
+    - "Non-zero exit from a blocking setup hook can abort the setup process."
+    - "Useful for running pre-flight checks before CCMC installs hooks into settings.json."
+  detail: |
+    ## When it fires
+    During a CC setup or initialization flow — when `ccmc setup` is run or equivalent first-time configuration is triggered.
+
+    ## Available matchers
+    - `project` — match by absolute project directory path (if project-scoped setup)
+
+    ## JSON input schema
+    ```json
+    {
+      "project_path": "string",
+      "setup_type": "string (global | project)",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command for pre-flight checks or environment validation
+    - `http` — HTTP POST to a URL
+
+    ## Exit code behavior
+    - `0` — setup continues
+    - Non-zero — setup is aborted (if handler is blocking)
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "Setup": [
+          {
+            "matcher": {},
+            "hooks": [
+              {
+                "type": "command",
+                "command": "bash ~/.claude/hooks/preflight-check.sh",
+                "wait": true
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+- name: WorktreeCreated
+  category: hooks
+  description: Fires when a new git worktree is created for a CC session using the EnterWorktree tool or --worktree flag.
+  usage: ""
+  examples:
+    - "matcher: {}"
+    - "matcher: { project: \"/Users/me/myproject\" }"
+  related:
+    - SessionStart
+    - CwdChanged
+    - FileChanged
+  gotchas:
+    - "Only fires when CC itself creates the worktree — not for worktrees created externally via git."
+    - "The worktree_path is the root of the newly created worktree, distinct from the original project_path."
+    - "The base_branch field indicates the branch the worktree was created from."
+  detail: |
+    ## When it fires
+    When CC creates a new git worktree — via the EnterWorktree tool or the `--worktree` CLI flag — establishing an isolated working environment for the session.
+
+    ## Available matchers
+    - `project` — match by absolute project directory path (original repo)
+    - `session_id` — match by session ID
+
+    ## JSON input schema
+    ```json
+    {
+      "session_id": "string",
+      "project_path": "string",
+      "worktree_path": "string",
+      "base_branch": "string",
+      "worktree_branch": "string",
+      "timestamp": "string (ISO 8601)"
+    }
+    ```
+
+    ## Supported handler types
+    - `command` — shell command for worktree setup (e.g. installing deps in the new worktree)
+    - `http` — HTTP POST to a URL
+
+    ## Exit code behavior
+    - Exit code is ignored — informational event (worktree already created)
+
+    ## Example config
+    ```json
+    {
+      "hooks": {
+        "WorktreeCreated": [
+          {
+            "matcher": {},
+            "hooks": [
+              {
+                "type": "command",
+                "command": "bash ~/.claude/hooks/worktree-setup.sh",
+                "wait": true
+              }
+            ]
+          }
+        ]
+      }
+    }
+    ```
