@@ -2,13 +2,17 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"sort"
+	"strings"
 	"text/tabwriter"
 	"time"
 
 	"ccmc/internal/daemon"
 	"ccmc/internal/inspector"
+	"ccmc/internal/reference"
+	"ccmc/pkg/ccmc"
 )
 
 // version is injected at build time via ldflags.
@@ -94,7 +98,10 @@ func main() {
 	case "launch":
 		notImplemented("launch")
 	case "ref":
-		notImplemented("ref")
+		code := runRef(args[1:], os.Stdout, os.Stderr)
+		if code != 0 {
+			os.Exit(code)
+		}
 	case "inventory":
 		notImplemented("inventory")
 	case "eval":
@@ -349,6 +356,136 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+// knownCategories maps the string representation of each RefCategory to its
+// typed constant. Used to distinguish category args from free-text queries.
+var knownCategories = map[string]ccmc.RefCategory{
+	"commands":    ccmc.RefCommands,
+	"skills":      ccmc.RefSkills,
+	"flags":       ccmc.RefFlags,
+	"shortcuts":   ccmc.RefShortcuts,
+	"hooks":       ccmc.RefHooks,
+	"tools":       ccmc.RefTools,
+	"frontmatter": ccmc.RefFrontmatter,
+	"envvars":     ccmc.RefEnvVars,
+	"filepaths":   ccmc.RefFilePaths,
+}
+
+// runRef handles the three invocation shapes for "ccmc ref":
+//
+//	ccmc ref <query>              — fuzzy search across all categories, top 10
+//	ccmc ref <category>           — list all entries in the named category
+//	ccmc ref <category> <name>    — full detail for the top fuzzy match within the category
+//
+// It writes output to out and errors to errOut. Returns a Unix exit code.
+func runRef(args []string, out io.Writer, errOut io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintf(errOut, "ccmc ref: missing argument\nUsage: ccmc ref <query|category> [name]\n")
+		return 2
+	}
+
+	entries, err := reference.LoadAll()
+	if err != nil {
+		fmt.Fprintf(errOut, "ccmc ref: load reference data: %v\n", err)
+		return 1
+	}
+	eng := reference.NewEngine(entries)
+
+	arg0 := strings.ToLower(strings.TrimSpace(args[0]))
+	cat, isCategory := knownCategories[arg0]
+
+	switch {
+	case isCategory && len(args) >= 2:
+		// Shape 3: ccmc ref <category> <name> — full detail, top fuzzy hit within category
+		name := strings.Join(args[1:], " ")
+		results := eng.Search(name, &cat, 1)
+		if len(results) == 0 {
+			fmt.Fprintf(errOut, "ccmc ref: no match for %q in category %q\n", name, arg0)
+			return 1
+		}
+		printRefDetail(out, results[0])
+
+	case isCategory:
+		// Shape 2: ccmc ref <category> — list all entries in the category
+		results := eng.Search("", &cat, 0)
+		if len(results) == 0 {
+			fmt.Fprintf(out, "No entries found for category %q.\n", arg0)
+			return 0
+		}
+		printRefList(out, results)
+
+	default:
+		// Shape 1: ccmc ref <query> — fuzzy search across all categories, top 10
+		query := strings.Join(args, " ")
+		results := eng.Search(query, nil, 10)
+		if len(results) == 0 {
+			fmt.Fprintf(out, "No results for %q.\n", query)
+			return 0
+		}
+		printRefList(out, results)
+	}
+
+	return 0
+}
+
+// printRefList prints a compact tabular listing of ref entries.
+func printRefList(out io.Writer, entries []ccmc.RefEntry) {
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tCATEGORY\tDESCRIPTION")
+	fmt.Fprintln(w, "----\t--------\t-----------")
+	for _, e := range entries {
+		desc := e.Description
+		if len(desc) > 72 {
+			desc = desc[:72] + "..."
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\n", e.Name, string(e.Category), desc)
+	}
+	w.Flush()
+}
+
+// printRefDetail prints all populated fields of a single RefEntry.
+func printRefDetail(out io.Writer, e ccmc.RefEntry) {
+	sep := "────────────────────────────────────────"
+	fmt.Fprintln(out, sep)
+	fmt.Fprintf(out, "NAME      %s\n", e.Name)
+	fmt.Fprintf(out, "CATEGORY  %s\n", string(e.Category))
+	if e.Description != "" {
+		fmt.Fprintf(out, "DESC      %s\n", e.Description)
+	}
+	if e.Usage != "" {
+		fmt.Fprintln(out, sep)
+		fmt.Fprintf(out, "USAGE\n  %s\n", e.Usage)
+	}
+	if len(e.Examples) > 0 {
+		fmt.Fprintln(out, sep)
+		fmt.Fprintln(out, "EXAMPLES")
+		for _, ex := range e.Examples {
+			fmt.Fprintf(out, "  %s\n", ex)
+		}
+	}
+	if len(e.Related) > 0 {
+		fmt.Fprintln(out, sep)
+		fmt.Fprintln(out, "RELATED")
+		for _, r := range e.Related {
+			fmt.Fprintf(out, "  %s\n", r)
+		}
+	}
+	if len(e.Gotchas) > 0 {
+		fmt.Fprintln(out, sep)
+		fmt.Fprintln(out, "GOTCHAS")
+		for _, g := range e.Gotchas {
+			fmt.Fprintf(out, "  %s\n", g)
+		}
+	}
+	if e.Detail != "" {
+		fmt.Fprintln(out, sep)
+		fmt.Fprintln(out, "DETAIL")
+		for _, line := range splitLines(e.Detail) {
+			fmt.Fprintf(out, "  %s\n", line)
+		}
+	}
+	fmt.Fprintln(out, sep)
 }
 
 func notImplemented(cmd string) {
