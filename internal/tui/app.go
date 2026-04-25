@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"ccmc/internal/reference"
 	"ccmc/pkg/ccmc"
 )
 
@@ -47,16 +48,24 @@ type sessionsRefreshedMsg struct {
 	err      error
 }
 
+// AppConfig bundles all App dependencies. Using a config struct rather than
+// positional parameters makes it safe to extend (adding the reference engine
+// here avoids breaking the existing tests that call NewApp directly).
+type AppConfig struct {
+	Client daemonClient
+	Engine *reference.Engine // nil is safe — reference panel shows no results
+}
+
 // App is the top-level Bubble Tea model. It owns the terminal lifecycle,
 // routes key events to the focused panel, and manages daemon polling.
 type App struct {
-	client       daemonClient
-	sessions     []ccmc.Session
-	daemonStatus ccmc.DaemonStatus
-	daemonErr    error // last poll error; nil when daemon is healthy
-	focused      panel
-	width        int
-	height       int
+	client        daemonClient
+	sessions      []ccmc.Session
+	daemonStatus  ccmc.DaemonStatus
+	daemonErr     error // last poll error; nil when daemon is healthy
+	focused       panel
+	width         int
+	height        int
 	inventoryMode bool // true when 'i' has toggled right panel to inventory view
 
 	// sub-models — each is an interface so tasks 33-36 and 47 can replace stubs
@@ -69,15 +78,22 @@ type App struct {
 
 // NewApp constructs an App backed by the supplied daemon client.
 // The client is typically *ccmc.Client; tests pass a stub satisfying daemonClient.
+// Engine may be nil; the reference overlay will render with no results.
 func NewApp(client daemonClient) App {
+	return NewAppWithConfig(AppConfig{Client: client})
+}
+
+// NewAppWithConfig constructs an App from a full config. Use this when wiring the
+// reference engine from the entry-point (task 41).
+func NewAppWithConfig(cfg AppConfig) App {
 	return App{
-		client:         client,
+		client:         cfg.Client,
 		focused:        panelSessions,
-		sessionsModel:  &stubSessions{},
-		inspectorModel: &stubInspector{},
+		sessionsModel:  NewSessionsPanel(),
+		inspectorModel: NewInspectorPanel(cfg.Client),
 		inventoryModel: &stubInventory{},
-		referenceModel: &stubReference{},
-		commandBar:     &stubCommandBar{},
+		referenceModel: NewReferencePanel(cfg.Engine),
+		commandBar:     NewCommandBarPanel(),
 	}
 }
 
@@ -103,7 +119,8 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		a.width = msg.Width
 		a.height = msg.Height
-		return a, nil
+		// Propagate dimensions to panels so they can truncate and layout correctly.
+		return a, a.dispatchSizeMsg(msg.Width, msg.Height)
 
 	case tickMsg:
 		return a, a.fetchSessions()
@@ -121,6 +138,29 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.daemonErr = nil
 		a.sessions = msg.sessions
 		a.daemonStatus = msg.status
+		// Push refreshed session list into the sessions panel.
+		updated, cmd := a.sessionsModel.Update(msg)
+		a.sessionsModel = updated
+		return a, cmd
+
+	case SessionSelectedMsg:
+		// Route cursor-change notifications to the inspector regardless of focus.
+		updated, cmd := a.inspectorModel.Update(msg)
+		a.inspectorModel = updated
+		return a, cmd
+
+	case inspectorLoadedMsg:
+		// Route completed aggregation result to the inspector.
+		updated, cmd := a.inspectorModel.Update(msg)
+		a.inspectorModel = updated
+		return a, cmd
+
+	case closeOverlayMsg:
+		// Reference overlay requested its own close.
+		a.referenceModel.Blur()
+		a.focused = panelSessions
+		a.sessionsModel.Focus()
+		a.commandBar.Update(focusChangedMsg{active: panelSessions, width: a.width})
 		return a, nil
 
 	case tea.KeyMsg:
@@ -131,8 +171,10 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "?", "/":
 			// Open reference overlay regardless of current focus.
+			a.blurAllPanels()
 			a.focused = panelReference
 			a.referenceModel.Focus()
+			a.commandBar.Update(focusChangedMsg{active: panelReference, width: a.width})
 			return a, nil
 
 		case "esc":
@@ -140,6 +182,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.referenceModel.Blur()
 				a.focused = panelSessions
 				a.sessionsModel.Focus()
+				a.commandBar.Update(focusChangedMsg{active: panelSessions, width: a.width})
 			}
 			return a, nil
 
@@ -151,15 +194,18 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if a.inventoryMode {
 					a.focused = panelInventory
 					a.inventoryModel.Focus()
+					a.commandBar.Update(focusChangedMsg{active: panelInventory, width: a.width})
 				} else {
 					a.focused = panelInspector
 					a.inspectorModel.Focus()
+					a.commandBar.Update(focusChangedMsg{active: panelInspector, width: a.width})
 				}
 			default:
 				// Any right-panel focus returns to sessions on Tab.
 				a.blurAllPanels()
 				a.focused = panelSessions
 				a.sessionsModel.Focus()
+				a.commandBar.Update(focusChangedMsg{active: panelSessions, width: a.width})
 			}
 			return a, nil
 
@@ -172,10 +218,12 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.inspectorModel.Blur()
 				a.focused = panelInventory
 				a.inventoryModel.Focus()
+				a.commandBar.Update(focusChangedMsg{active: panelInventory, width: a.width})
 			} else if a.focused == panelInventory {
 				a.inventoryModel.Blur()
 				a.focused = panelInspector
 				a.inspectorModel.Focus()
+				a.commandBar.Update(focusChangedMsg{active: panelInspector, width: a.width})
 			}
 			return a, nil
 		}
@@ -183,6 +231,23 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// Forward all other messages to the focused panel.
 	return a.dispatchToFocused(msg)
+}
+
+// dispatchSizeMsg broadcasts terminal dimensions to all panels so each can
+// calculate truncation and viewport heights without querying the terminal.
+func (a App) dispatchSizeMsg(w, h int) tea.Cmd {
+	leftW := (w * 40) / 100
+	rightW := w - leftW
+
+	const cmdBarH = 1
+	bodyH := h - cmdBarH
+
+	pane := paneSizeMsg{w: leftW - 4, h: bodyH - 4}
+	a.sessionsModel.Update(pane)
+	a.inspectorModel.Update(paneSizeMsg{w: rightW - 4, h: bodyH - 4})
+	a.referenceModel.Update(pane)
+	a.commandBar.Update(focusChangedMsg{active: a.focused, width: w})
+	return nil
 }
 
 // dispatchToFocused forwards msg to whichever panel has focus and merges the

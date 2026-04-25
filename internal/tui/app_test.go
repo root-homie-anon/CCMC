@@ -192,11 +192,13 @@ func TestApp_View_HasNoColorsInTest(t *testing.T) {
 		t.Fatal("View() returned empty string")
 	}
 
-	// Stub panel placeholders must be present.
+	// Verify content from the real panel implementations.
+	// Sessions panel: list has one entry so it renders rows, not the empty state.
+	// Inspector panel: no session selected yet → placeholder text.
+	// Command bar: always shows at minimum "[q] quit".
 	checks := []string{
-		"[sessions panel — task 33]",
-		"[inspector panel — task 34]",
-		"[command bar — task 36]",
+		"(select a session)", // inspector empty state
+		"[q] quit",           // command bar — present in every hint string
 	}
 	for _, want := range checks {
 		if !strings.Contains(view, want) {
