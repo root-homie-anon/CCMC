@@ -39,15 +39,20 @@ type referenceModel struct {
 }
 
 // NewReferencePanel constructs the reference overlay with the given search engine.
+// engine may be nil; the overlay will render with no results in that case.
+// Note: we must not assign a typed nil (*reference.Engine)(nil) to the searcher
+// interface — that would produce a non-nil interface value whose dynamic value is nil,
+// breaking the `if m.engine == nil` guard. Instead we store an explicit nil interface.
 func NewReferencePanel(engine *reference.Engine) ReferencePanel {
 	ti := textinput.New()
 	ti.Placeholder = "search…"
 	ti.CharLimit = 128
 
-	return &referenceModel{
-		engine: engine,
-		input:  ti,
+	m := &referenceModel{input: ti}
+	if engine != nil {
+		m.engine = engine
 	}
+	return m
 }
 
 func (m *referenceModel) Focus() {

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -17,6 +18,10 @@ import (
 // feeling live without hammering the unix socket on slow machines.
 const pollInterval = 500 * time.Millisecond
 
+// statusLineTTL is how long a transient status message stays visible before
+// being cleared. The next polling tick also clears an expired status.
+const statusLineTTL = 4 * time.Second
+
 // daemonClient is the test-seam interface for the daemon API client.
 // *ccmc.Client satisfies this interface implicitly; tests supply a stub.
 // Keeping it narrow (only what App needs) avoids coupling to the full client API.
@@ -25,15 +30,48 @@ type daemonClient interface {
 	Status() (ccmc.DaemonStatus, error)
 }
 
+// killFunc is the lifecycle seam for killing a session. Tests replace this to
+// assert the right session ID is passed without invoking the OS process machinery.
+var killFunc = func(client daemonClient, id string) error {
+	// Production path: type-assert to *ccmc.Client. The real App is always
+	// constructed with a *ccmc.Client; only test stubs bypass this.
+	cc, ok := client.(*ccmc.Client)
+	if !ok {
+		return fmt.Errorf("kill: client does not support lifecycle operations")
+	}
+	// Import lifecycle indirectly via a shim to avoid an import cycle.
+	// lifecycle.Kill is called here; the import is at package init below.
+	return lifecycleKill(cc, id)
+}
+
+// launchFunc is the lifecycle seam for launching a new session. Tests replace
+// this to capture the directory argument without invoking osascript.
+var launchFunc = func(client daemonClient, dir string) (string, error) {
+	cc, ok := client.(*ccmc.Client)
+	if !ok {
+		return "", fmt.Errorf("launch: client does not support lifecycle operations")
+	}
+	return lifecycleLaunch(cc, dir)
+}
+
+// openInITermFunc is the lifecycle seam for opening a directory in iTerm. Tests
+// replace this to capture the directory argument without invoking osascript.
+var openInITermFunc = func(dir string) error {
+	return lifecycleOpenInITerm(dir)
+}
+
 // panel is an enum identifying which panel currently holds keyboard focus.
 type panel int
 
 const (
-	panelSessions   panel = iota // left column — session list
-	panelInspector               // right column — session inspector
-	panelInventory               // right column — inventory view (switched via 'i')
-	panelReference               // overlay — reference search
-	panelCommandBar              // bottom row
+	panelSessions      panel = iota // left column — session list
+	panelInspector                  // right column — session inspector
+	panelInventory                  // right column — inventory view (switched via 'i')
+	panelReference                  // overlay — reference search
+	panelCommandBar                 // bottom row
+	panelLaunchPrompt               // modal — directory prompt for 'l'
+	panelKillConfirm                // modal — kill confirmation prompt for 'k'
+	panelHelp                       // modal — keyboard help overlay for 'h'
 )
 
 // tickMsg fires every pollInterval to trigger a daemon data refresh.
@@ -46,6 +84,13 @@ type sessionsRefreshedMsg struct {
 	sessions []ccmc.Session
 	status   ccmc.DaemonStatus
 	err      error
+}
+
+// lifecycleResultMsg carries the result of an async kill or launch operation.
+type lifecycleResultMsg struct {
+	op  string // "kill" or "launch"
+	id  string // session ID (launch: new ID; kill: killed ID)
+	err error
 }
 
 // AppConfig bundles all App dependencies. Using a config struct rather than
@@ -68,6 +113,17 @@ type App struct {
 	height        int
 	inventoryMode bool // true when 'i' has toggled right panel to inventory view
 
+	// ── Prompt / modal state ──────────────────────────────────────────────────
+	launchInput     textinput.Model // active when focused == panelLaunchPrompt
+	killTargetID    string          // session ID to kill; set when focused == panelKillConfirm
+	killTargetPath  string          // ProjectPath of killTargetID (for the confirm prompt)
+
+	// ── Transient status line ─────────────────────────────────────────────────
+	// statusLine is shown above the command bar. Cleared by the next tick after
+	// statusExpiry, or immediately when a new status replaces it.
+	statusLine   string
+	statusExpiry time.Time
+
 	// sub-models — each is an interface so tasks 33-36 and 47 can replace stubs
 	sessionsModel  SessionsPanel
 	inspectorModel InspectorPanel
@@ -86,9 +142,14 @@ func NewApp(client daemonClient) App {
 // NewAppWithConfig constructs an App from a full config. Use this when wiring the
 // reference engine from the entry-point (task 41).
 func NewAppWithConfig(cfg AppConfig) App {
+	ti := textinput.New()
+	ti.Placeholder = "directory path"
+	ti.CharLimit = 512
+
 	return App{
 		client:         cfg.Client,
 		focused:        panelSessions,
+		launchInput:    ti,
 		sessionsModel:  NewSessionsPanel(),
 		inspectorModel: NewInspectorPanel(cfg.Client),
 		inventoryModel: &stubInventory{},
@@ -109,6 +170,7 @@ func (a App) Init() tea.Cmd {
 
 // Update handles all incoming messages. Key routing:
 //   - Global keys (q, Ctrl+C, ?, /, Esc, Tab, i) are consumed here.
+//   - Modal keys (l, k, h, r, o) are consumed here when appropriate.
 //   - All other keys are forwarded to the focused panel.
 //   - tickMsg fires a daemon refresh command.
 //   - sessionsRefreshedMsg merges new daemon data into App state.
@@ -123,6 +185,10 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, a.dispatchSizeMsg(msg.Width, msg.Height)
 
 	case tickMsg:
+		// Clear expired status line on each tick.
+		if a.statusLine != "" && time.Now().After(a.statusExpiry) {
+			a.statusLine = ""
+		}
 		return a, a.fetchSessions()
 
 	case sessionsRefreshedMsg:
@@ -142,6 +208,23 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		updated, cmd := a.sessionsModel.Update(msg)
 		a.sessionsModel = updated
 		return a, cmd
+
+	case lifecycleResultMsg:
+		switch msg.op {
+		case "kill":
+			if msg.err != nil {
+				a.setStatus("kill failed: " + msg.err.Error())
+			} else {
+				a.setStatus("killed session " + msg.id)
+			}
+		case "launch":
+			if msg.err != nil {
+				a.setStatus("launch failed: " + msg.err.Error())
+			} else {
+				a.setStatus("launched session " + msg.id)
+			}
+		}
+		return a, nil
 
 	case SessionSelectedMsg:
 		// Route cursor-change notifications to the inspector regardless of focus.
@@ -164,6 +247,18 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case tea.KeyMsg:
+		// ── Modal intercepts (launch prompt, kill confirm, help) ──────────────
+		// These modes consume all keys, returning to normal focus on close keys.
+		if a.focused == panelLaunchPrompt {
+			return a.handleLaunchPromptKey(msg)
+		}
+		if a.focused == panelKillConfirm {
+			return a.handleKillConfirmKey(msg)
+		}
+		if a.focused == panelHelp {
+			return a.handleHelpKey(msg)
+		}
+
 		switch msg.String() {
 
 		case "q", "ctrl+c":
@@ -175,6 +270,17 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.focused = panelReference
 			a.referenceModel.Focus()
 			a.commandBar.Update(focusChangedMsg{active: panelReference, width: a.width})
+			return a, nil
+
+		case "h":
+			// Open the keyboard help overlay. Not triggered when the reference
+			// overlay is open — the reference panel owns the keyboard in that state
+			// so 'h' types into the search box instead.
+			if a.focused == panelReference {
+				break
+			}
+			a.blurAllPanels()
+			a.focused = panelHelp
 			return a, nil
 
 		case "esc":
@@ -226,11 +332,143 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.commandBar.Update(focusChangedMsg{active: panelInspector, width: a.width})
 			}
 			return a, nil
+
+		case "r":
+			// Force an immediate daemon refresh outside the polling tick.
+			return a, a.fetchSessions()
+
+		case "l":
+			// Open launch prompt, pre-populated with the selected session's ProjectPath.
+			if a.focused != panelSessions {
+				break
+			}
+			a.blurAllPanels()
+			a.focused = panelLaunchPrompt
+			dir := ""
+			if sel := a.sessionsModel.Selected(); sel != nil {
+				dir = sel.ProjectPath
+			}
+			a.launchInput.SetValue(dir)
+			a.launchInput.Focus()
+			a.launchInput.CursorEnd()
+			return a, textinput.Blink
+
+		case "k":
+			// Open kill confirmation prompt for the selected session.
+			if a.focused != panelSessions {
+				break
+			}
+			sel := a.sessionsModel.Selected()
+			if sel == nil {
+				break
+			}
+			a.blurAllPanels()
+			a.focused = panelKillConfirm
+			a.killTargetID = sel.ID
+			a.killTargetPath = sel.ProjectPath
+			return a, nil
+
+		case "o":
+			// Open the selected session's project directory in a new iTerm tab.
+			if a.focused != panelSessions {
+				break
+			}
+			sel := a.sessionsModel.Selected()
+			if sel == nil {
+				break
+			}
+			dir := sel.ProjectPath
+			return a, func() tea.Msg {
+				if err := openInITermFunc(dir); err != nil {
+					return lifecycleResultMsg{op: "open", err: err}
+				}
+				return lifecycleResultMsg{op: "open"}
+			}
 		}
 	}
 
 	// Forward all other messages to the focused panel.
 	return a.dispatchToFocused(msg)
+}
+
+// handleLaunchPromptKey processes keys while the launch directory prompt is open.
+func (a App) handleLaunchPromptKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		// Cancel prompt — return to sessions panel.
+		a.launchInput.Blur()
+		a.focused = panelSessions
+		a.sessionsModel.Focus()
+		a.commandBar.Update(focusChangedMsg{active: panelSessions, width: a.width})
+		return a, nil
+
+	case tea.KeyEnter:
+		dir := strings.TrimSpace(a.launchInput.Value())
+		if dir == "" {
+			return a, nil
+		}
+		a.launchInput.Blur()
+		a.focused = panelSessions
+		a.sessionsModel.Focus()
+		a.commandBar.Update(focusChangedMsg{active: panelSessions, width: a.width})
+		a.setStatus("launching…")
+		client := a.client
+		return a, func() tea.Msg {
+			id, err := launchFunc(client, dir)
+			return lifecycleResultMsg{op: "launch", id: id, err: err}
+		}
+	}
+
+	// Forward all other keys to the textinput.
+	var cmd tea.Cmd
+	a.launchInput, cmd = a.launchInput.Update(msg)
+	return a, cmd
+}
+
+// handleKillConfirmKey processes keys while the kill confirmation prompt is open.
+func (a App) handleKillConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y":
+		id := a.killTargetID
+		a.killTargetID = ""
+		a.killTargetPath = ""
+		a.focused = panelSessions
+		a.sessionsModel.Focus()
+		a.commandBar.Update(focusChangedMsg{active: panelSessions, width: a.width})
+		a.setStatus("killing…")
+		client := a.client
+		return a, func() tea.Msg {
+			err := killFunc(client, id)
+			return lifecycleResultMsg{op: "kill", id: id, err: err}
+		}
+
+	default:
+		// Any other key cancels — including 'n', 'N', Esc.
+		a.killTargetID = ""
+		a.killTargetPath = ""
+		a.focused = panelSessions
+		a.sessionsModel.Focus()
+		a.commandBar.Update(focusChangedMsg{active: panelSessions, width: a.width})
+		return a, nil
+	}
+}
+
+// handleHelpKey processes keys while the help overlay is open. Only Esc closes it.
+func (a App) handleHelpKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		a.focused = panelSessions
+		a.sessionsModel.Focus()
+		a.commandBar.Update(focusChangedMsg{active: panelSessions, width: a.width})
+	}
+	// All other keys are consumed by the overlay (no forwarding).
+	return a, nil
+}
+
+// setStatus sets a transient status line that disappears after statusLineTTL.
+func (a *App) setStatus(msg string) {
+	a.statusLine = msg
+	a.statusExpiry = time.Now().Add(statusLineTTL)
 }
 
 // dispatchSizeMsg broadcasts terminal dimensions to all panels so each can
@@ -282,9 +520,12 @@ func (a App) dispatchToFocused(msg tea.Msg) (tea.Model, tea.Cmd) {
 //
 //	[daemon warning]        — only when daemonErr is set
 //	[left panel | right panel]
+//	[status line]           — only when statusLine is non-empty
 //	[command bar]
 //
 // When the reference overlay is open it is rendered over the two-column layout.
+// When the launch prompt, kill confirm, or help overlay is open they are rendered
+// as inline boxes above the command bar.
 // No dimensions are hardcoded — everything derives from a.width / a.height.
 func (a App) View() string {
 	if a.width == 0 || a.height == 0 {
@@ -305,10 +546,13 @@ func (a App) View() string {
 	}
 
 	// ── Layout dimensions ─────────────────────────────────────────────────────
-	// Reserve 1 row for the command bar and 1 for the warning (if shown).
-	// Border styles add 2 rows (top+bottom) and 2 cols (left+right) each.
+	// Reserve 1 row for the command bar, 1 for warning (if shown), 1 for status.
 	const cmdBarHeight = 1
-	bodyHeight := a.height - cmdBarHeight - warningHeight
+	statusHeight := 0
+	if a.statusLine != "" {
+		statusHeight = 1
+	}
+	bodyHeight := a.height - cmdBarHeight - warningHeight - statusHeight
 
 	leftWidth := (a.width * 40) / 100
 	rightWidth := a.width - leftWidth
@@ -373,8 +617,6 @@ func (a App) View() string {
 		overlayContent := a.referenceModel.View()
 		overlay := OverlayPanel.Width(overlayWidth - 4).Height(overlayHeight - 2).Render(overlayContent)
 
-		// Simple centering: pad the overlay with spaces to approximate centre
-		// position. lipgloss.Place is not yet available in all versions.
 		padLeft := (a.width - overlayWidth) / 2
 		padTop := (bodyHeight - overlayHeight) / 2
 		if padLeft < 0 {
@@ -384,14 +626,9 @@ func (a App) View() string {
 			padTop = 0
 		}
 
-		// Build lines: blank rows above, then the overlay rows indented, then
-		// the rest of the screen left blank. This paints "over" body.
 		overlayLines := strings.Split(overlay, "\n")
 		bodyLines := strings.Split(body, "\n")
 
-		for i := 0; i < padTop && i < len(bodyLines); i++ {
-			// leave body lines unchanged above the overlay
-		}
 		indent := strings.Repeat(" ", padLeft)
 		for i, line := range overlayLines {
 			targetRow := padTop + i
@@ -405,10 +642,77 @@ func (a App) View() string {
 	b.WriteString(body)
 	b.WriteString("\n")
 
+	// ── Launch prompt overlay ─────────────────────────────────────────────────
+	if a.focused == panelLaunchPrompt {
+		prompt := OverlayPanel.Width(a.width - 8).Render(
+			"Launch new session\n\n" +
+				"Directory: " + a.launchInput.View() + "\n\n" +
+				HelpDesc.Render("[Enter] launch  [Esc] cancel"),
+		)
+		b.WriteString(prompt + "\n")
+	}
+
+	// ── Kill confirm overlay ──────────────────────────────────────────────────
+	if a.focused == panelKillConfirm {
+		confirm := OverlayPanel.Width(a.width - 8).Render(
+			fmt.Sprintf("Kill session %s in %s?\n\n", a.killTargetID, a.killTargetPath) +
+				HelpDesc.Render("[y] kill  [any other key] cancel"),
+		)
+		b.WriteString(confirm + "\n")
+	}
+
+	// ── Help overlay ──────────────────────────────────────────────────────────
+	if a.focused == panelHelp {
+		helpText := helpOverlayText()
+		help := OverlayPanel.Width(a.width - 8).Render(helpText)
+		b.WriteString(help + "\n")
+	}
+
+	// ── Status line ───────────────────────────────────────────────────────────
+	if a.statusLine != "" {
+		b.WriteString(Muted.Render(a.statusLine) + "\n")
+	}
+
 	// ── Command bar ───────────────────────────────────────────────────────────
 	b.WriteString(CommandBar.Width(a.width).Render(a.commandBar.View()))
 
 	return b.String()
+}
+
+// helpOverlayText returns the keyboard help overlay content grouped by context.
+func helpOverlayText() string {
+	return strings.Join([]string{
+		Title.Render("Keyboard Help"),
+		"",
+		HelpKey.Render("Global"),
+		"  [q] / [ctrl+c]   quit",
+		"  [?] / [/]        open reference overlay",
+		"  [h]              this help screen",
+		"  [Tab]            cycle panel focus",
+		"  [Esc]            close overlay / cancel",
+		"  [r]              force refresh from daemon",
+		"",
+		HelpKey.Render("Session List (left panel)"),
+		"  [↑] / [k]        move up",
+		"  [↓] / [j]        move down",
+		"  [Enter]          select session",
+		"  [l]              launch new session (directory prompt)",
+		"  [k]              kill selected session (confirmation prompt)",
+		"  [o]              open project directory in iTerm",
+		"  [i]              toggle inspector / inventory panel",
+		"",
+		HelpKey.Render("Inspector / Inventory (right panel)"),
+		"  [↑] / [↓]        scroll",
+		"  [Tab]            return to session list",
+		"",
+		HelpKey.Render("Reference Overlay"),
+		"  [type]           fuzzy search",
+		"  [↑] / [↓]        navigate results",
+		"  [Enter]          show detail",
+		"  [Esc]            close overlay",
+		"",
+		HelpDesc.Render("[Esc] close help"),
+	}, "\n")
 }
 
 // fetchSessions returns a Cmd that queries the daemon for sessions and status,
@@ -438,4 +742,5 @@ func (a *App) blurAllPanels() {
 	a.inventoryModel.Blur()
 	a.referenceModel.Blur()
 	a.commandBar.Blur()
+	a.launchInput.Blur()
 }

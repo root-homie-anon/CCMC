@@ -26,17 +26,27 @@ import (
 	"text/tabwriter"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"ccmc/internal/config"
 	"ccmc/internal/daemon"
 	"ccmc/internal/hooks"
 	"ccmc/internal/lifecycle"
+	"ccmc/internal/reference"
+	"ccmc/internal/tui"
 	"ccmc/pkg/ccmc"
 )
 
+// runProgram is the seam used to start the Bubble Tea program. Tests replace
+// this to verify the dashboard path is taken without actually running the TUI.
+var runProgram = func(p *tea.Program) error {
+	_, err := p.Run()
+	return err
+}
+
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "ccmc: dashboard not yet implemented")
-		return 2
+		return runDashboard(stderr)
 	}
 
 	cmd := args[0]
@@ -637,5 +647,44 @@ func runLaunch(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout, "launched session %s in %s\n", id, dir)
+	return 0
+}
+
+// ── dashboard (task 41) ───────────────────────────────────────────────────────
+
+// runDashboard launches the Bubble Tea TUI dashboard. It constructs a daemon
+// client with auto-start so the daemon is transparently started if not running,
+// loads the embedded reference engine, and runs the program in alt-screen mode.
+//
+// The daemon is NOT stopped on exit — its own idle-timeout reaps it eventually.
+// This is intentional: the user may have other tools or CLI commands still using
+// the daemon.
+func runDashboard(stderr io.Writer) int {
+	// Auto-start the daemon if it is not already running so the dashboard has
+	// live session data from the first render.
+	client := ccmc.NewClient(ccmc.WithAutoStart(true))
+
+	// Load the embedded reference YAML data. A failure here means the binary
+	// was built with a missing or corrupt embed — surface it immediately.
+	entries, err := reference.LoadAll()
+	if err != nil {
+		fmt.Fprintf(stderr, "ccmc: load reference data: %v\n", err)
+		return 1
+	}
+	engine := reference.NewEngine(entries)
+
+	app := tui.NewAppWithConfig(tui.AppConfig{
+		Client: client,
+		Engine: engine,
+	})
+
+	p := tea.NewProgram(app,
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+	)
+	if err := runProgram(p); err != nil {
+		fmt.Fprintf(stderr, "ccmc: dashboard: %v\n", err)
+		return 1
+	}
 	return 0
 }

@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"ccmc/internal/config"
 	"ccmc/internal/daemon"
 	"ccmc/internal/hooks"
@@ -278,11 +280,73 @@ func TestRun_UnknownCmd(t *testing.T) {
 	}
 }
 
-// TestRun_NoArgs verifies "ccmc" with no args exits 2 (dashboard not yet implemented).
+// TestRun_NoArgs verifies "ccmc" with no args launches the dashboard (exit 0).
+// The runProgram seam is replaced so the TUI does not actually start.
 func TestRun_NoArgs(t *testing.T) {
-	_, _, code := runCmd(nil)
+	// Stub runProgram so the test exits cleanly without a real terminal.
+	origRun := runProgram
+	dashboardCalled := false
+	runProgram = func(p *tea.Program) error {
+		dashboardCalled = true
+		return nil
+	}
+	t.Cleanup(func() { runProgram = origRun })
+
+	_, errOut, code := runCmd(nil)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
+	}
+	if !dashboardCalled {
+		t.Error("expected the dashboard program runner to be called on no-args invocation")
+	}
+}
+
+// TestRun_HelpDoesNotLaunchDashboard verifies that --help prints usage and does
+// NOT invoke the dashboard runner.
+func TestRun_HelpDoesNotLaunchDashboard(t *testing.T) {
+	origRun := runProgram
+	dashboardCalled := false
+	runProgram = func(p *tea.Program) error {
+		dashboardCalled = true
+		return nil
+	}
+	t.Cleanup(func() { runProgram = origRun })
+
+	var outBuf bytes.Buffer
+	code := run([]string{"--help"}, &outBuf, &outBuf)
+	// --help is handled by the "help" case (no, wait — "--help" falls to default).
+	// Actually the switch has "help", "--help", "-h" all routing to helpText.
+	if code != 0 {
+		t.Fatalf("expected exit 0 for --help, got %d", code)
+	}
+	if dashboardCalled {
+		t.Error("--help must NOT launch the dashboard")
+	}
+	if !strings.Contains(outBuf.String(), "Usage:") {
+		t.Errorf("expected help text in output, got: %q", outBuf.String())
+	}
+}
+
+// TestRun_UnknownSubcommandStillErrors verifies that an unrecognized subcommand
+// exits 2 with an error message and does NOT launch the dashboard.
+func TestRun_UnknownSubcommandStillErrors(t *testing.T) {
+	origRun := runProgram
+	dashboardCalled := false
+	runProgram = func(p *tea.Program) error {
+		dashboardCalled = true
+		return nil
+	}
+	t.Cleanup(func() { runProgram = origRun })
+
+	_, errOut, code := runCmd([]string{"nonsensesubcommand"})
 	if code != 2 {
-		t.Fatalf("expected exit 2, got %d", code)
+		t.Fatalf("expected exit 2 for unknown subcommand, got %d; stderr: %q", code, errOut)
+	}
+	if dashboardCalled {
+		t.Error("unknown subcommand must NOT launch the dashboard")
+	}
+	if !strings.Contains(errOut, "unknown command") {
+		t.Errorf("expected 'unknown command' in stderr, got: %q", errOut)
 	}
 }
 
