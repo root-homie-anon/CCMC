@@ -474,6 +474,73 @@ func TestApp_HKeyOpensHelpOverlay(t *testing.T) {
 	}
 }
 
+// TestApp_IKeySwapsRightPanelToInventory feeds 'i' from the sessions panel and
+// asserts the right panel now renders inventory content (category headers) instead
+// of the inspector placeholder.
+func TestApp_IKeySwapsRightPanelToInventory(t *testing.T) {
+	swapInventoryLoadFunc(t, func() inventoryLoadedMsg {
+		return inventoryLoadedMsg{
+			mcps: []ccmc.MCPEntry{{Name: "mcp-one", Scope: "global", Type: "stdio"}},
+		}
+	})
+
+	a := newTestApp()
+	// Simulate a window size so inventory panel gets its paneSizeMsg and fires the load.
+	updated, loadCmd := a.Update(tea.WindowSizeMsg{Width: 200, Height: 50})
+	a = updated.(App)
+	// Execute the load Cmd returned from dispatchSizeMsg → inventoryModel.Update.
+	if loadCmd != nil {
+		loadMsg := loadCmd()
+		if loadMsg != nil {
+			a = sendMsg(a, loadMsg)
+		}
+	}
+
+	// Press 'i' — inventoryMode toggles on and focus stays on sessions (not right panel).
+	a, _ = sendKey(a, "i")
+	if !a.inventoryMode {
+		t.Fatal("inventoryMode must be true after pressing 'i'")
+	}
+
+	view := a.View()
+	// The right panel should show inventory — look for the "Inventory" title header.
+	if !strings.Contains(view, "Inventory") {
+		t.Errorf("View() missing 'Inventory' header after 'i' press\nView:\n%s", view)
+	}
+	// Inspector placeholder must not be present when inventory mode is active.
+	if strings.Contains(view, "(select a session)") {
+		t.Errorf("View() still shows inspector placeholder when inventoryMode is true\nView:\n%s", view)
+	}
+}
+
+// TestApp_IKeyToggleSwapsBack feeds 'i' twice and asserts the inspector is shown again.
+func TestApp_IKeyToggleSwapsBack(t *testing.T) {
+	swapInventoryLoadFunc(t, func() inventoryLoadedMsg { return inventoryLoadedMsg{} })
+
+	a := newTestApp()
+	// Provide a window size so panels initialise.
+	updated, _ := a.Update(tea.WindowSizeMsg{Width: 200, Height: 50})
+	a = updated.(App)
+
+	// First 'i' — inventory mode on.
+	a, _ = sendKey(a, "i")
+	if !a.inventoryMode {
+		t.Fatal("precondition: inventoryMode must be true after first 'i'")
+	}
+
+	// Second 'i' — inventory mode off.
+	a, _ = sendKey(a, "i")
+	if a.inventoryMode {
+		t.Fatal("inventoryMode must be false after pressing 'i' twice")
+	}
+
+	view := a.View()
+	// Inspector should be visible again.
+	if !strings.Contains(view, "(select a session)") {
+		t.Errorf("View() missing inspector placeholder after toggling back\nView:\n%s", view)
+	}
+}
+
 func TestApp_HelpDoesNotConflictWithReferenceOverlay(t *testing.T) {
 	// When the reference overlay is open, 'h' should NOT open the help overlay.
 	// The reference overlay intercepts all key events via dispatchToFocused.

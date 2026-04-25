@@ -152,7 +152,7 @@ func NewAppWithConfig(cfg AppConfig) App {
 		launchInput:    ti,
 		sessionsModel:  NewSessionsPanel(),
 		inspectorModel: NewInspectorPanel(cfg.Client),
-		inventoryModel: &stubInventory{},
+		inventoryModel: NewInventoryPanel(),
 		referenceModel: NewReferencePanel(cfg.Engine),
 		commandBar:     NewCommandBarPanel(),
 	}
@@ -482,10 +482,13 @@ func (a App) dispatchSizeMsg(w, h int) tea.Cmd {
 
 	pane := paneSizeMsg{w: leftW - 4, h: bodyH - 4}
 	a.sessionsModel.Update(pane)
-	a.inspectorModel.Update(paneSizeMsg{w: rightW - 4, h: bodyH - 4})
+	rightPane := paneSizeMsg{w: rightW - 4, h: bodyH - 4}
+	a.inspectorModel.Update(rightPane)
+	updated, cmd := a.inventoryModel.Update(rightPane)
+	a.inventoryModel = updated
 	a.referenceModel.Update(pane)
 	a.commandBar.Update(focusChangedMsg{active: a.focused, width: w})
-	return nil
+	return cmd
 }
 
 // dispatchToFocused forwards msg to whichever panel has focus and merges the
