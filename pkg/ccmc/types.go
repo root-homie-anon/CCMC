@@ -119,6 +119,38 @@ type EvalResult struct {
 	Recommendation string   `json:"recommendation"`  // install | skip | investigate
 }
 
+// ScopeFiles holds the raw file paths collected for one inventory scope (global or one project).
+type ScopeFiles struct {
+	ProjectPath  string   // Empty for global scope; encoded project dir name for project scope.
+	SettingsPath string   // Absolute path to settings.json; empty if not present.
+	ClaudeMDPath string   // Absolute path to CLAUDE.md; empty if not present.
+	Commands     []string // Absolute paths to commands/*.md files.
+	Skills       []string // Absolute paths to skills/*/SKILL.md files (dirs without SKILL.md are skipped).
+	Agents       []string // Absolute paths to agents/*.md files.
+	Plugins      []string // Absolute paths to plugins/* entries (may be dirs or files).
+}
+
+// InventoryRaw is the unprocessed output of the filesystem scanner.
+// Downstream per-type modules (mcp.go, skills.go, agents.go, plugins.go) consume this.
+type InventoryRaw struct {
+	Global   ScopeFiles
+	Projects []ScopeFiles // Sorted ascending by ProjectPath.
+}
+
+// EvalContext is the evidence bundle the evaluator passes to the Anthropic API.
+// All fields come from the GitHub API; supplementary fields are empty string when absent.
+type EvalContext struct {
+	Owner           string   `json:"owner"`
+	Repo            string   `json:"repo"`
+	Description     string   `json:"description"`     // From repo metadata
+	Topics          []string `json:"topics"`          // GitHub topic tags
+	DefaultBranch   string   `json:"defaultBranch"`
+	ReadmeMarkdown  string   `json:"readmeMarkdown"`  // Raw text of first README hit
+	PackageJSON     string   `json:"packageJson"`     // Raw text if present at root, else ""
+	PyprojectTOML   string   `json:"pyprojectToml"`   // Raw text if present at root, else ""
+	ExampleSettings string   `json:"exampleSettings"` // settings.json at root or examples/, else ""
+}
+
 // DaemonStatus is the daemon health and registry summary returned by GET /status.
 type DaemonStatus struct {
 	Running       bool      `json:"running"`
