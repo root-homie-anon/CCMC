@@ -1,0 +1,177 @@
+- name: name
+  category: frontmatter
+  description: The display name for the skill, command, or agent — used in /agents, /mcp, and reference listings.
+  usage: "name: <string>"
+  examples:
+    - "name: ref-builder"
+    - "name: simplify"
+  related:
+    - description
+    - when-to-use
+  gotchas:
+    - "Name is used as the invocation key for skills and agents — keep it lowercase and hyphen-separated."
+    - "Changing the name in frontmatter changes the invocation name in the current session."
+
+- name: description
+  category: frontmatter
+  description: A one-line description of what the skill, command, or agent does — shown in /agents and the reference engine.
+  usage: "description: <string>"
+  examples:
+    - "description: Reviews changed code for reuse, quality, and efficiency."
+    - "description: Builds the session JSONL parser."
+  related:
+    - name
+    - when-to-use
+  gotchas:
+    - "Description feeds the fuzzy search index — make it specific and accurate for good searchability."
+
+- name: command
+  category: frontmatter
+  description: The shell command to execute when a command-type entry is invoked, for CCMC or custom command definitions.
+  usage: "command: <shell-command>"
+  examples:
+    - "command: go test ./..."
+    - "command: bash ~/.claude/hooks/preflight.sh"
+  related:
+    - shell
+    - hooks
+  gotchas:
+    - "Command runs in the project's working directory unless an absolute path is specified."
+
+- name: allowed-tools
+  category: frontmatter
+  description: Restricts which tools the agent or subagent may call, expressed as a list of tool names.
+  usage: "allowed-tools: [<tool-name>, ...]"
+  examples:
+    - "allowed-tools: [Read, Grep, Glob]"
+    - "allowed-tools: [Read, Write, Edit, Bash]"
+  related:
+    - model
+    - agent
+  gotchas:
+    - "Tool names must match the exact names used in permission rules (e.g. Bash, not bash)."
+    - "An empty list means no tool restrictions — specify the full set you want to allow."
+
+- name: argument-hint
+  category: frontmatter
+  description: Placeholder text shown in the command bar when the skill or command expects an argument.
+  usage: "argument-hint: <hint-text>"
+  examples:
+    - "argument-hint: <query>"
+    - "argument-hint: <github-url>"
+  related:
+    - name
+    - description
+  gotchas:
+    - "Used for display only — does not enforce argument validation."
+
+- name: model
+  category: frontmatter
+  description: Overrides the default model for the agent or subagent defined in this file.
+  usage: "model: <model-name>"
+  examples:
+    - "model: claude-opus-4-5"
+    - "model: claude-sonnet-4-6"
+  related:
+    - allowed-tools
+    - agent
+  gotchas:
+    - "Model must be a valid, available model name — invalid names cause the agent to fail to start."
+    - "Per-agent model override takes precedence over the session-level --model flag."
+
+- name: context
+  category: frontmatter
+  description: Specifies additional context files or paths to load into the agent's context at startup.
+  usage: "context: [<path>, ...]"
+  examples:
+    - "context: [README.md, internal/reference/loader.go]"
+  related:
+    - allowed-tools
+    - model
+  gotchas:
+    - "Paths are resolved relative to the project root at agent startup."
+
+- name: agent
+  category: frontmatter
+  description: Declares that this file defines an agent definition, distinguishing it from a skill or command file.
+  usage: "agent: true"
+  examples:
+    - "agent: true"
+  related:
+    - model
+    - allowed-tools
+  gotchas:
+    - "Required in agent markdown files in .claude/agents/ to be recognized as an agent definition."
+
+- name: disable-model-invocation
+  category: frontmatter
+  description: Prevents the model from invoking this skill automatically; requires explicit user invocation.
+  usage: "disable-model-invocation: true"
+  examples:
+    - "disable-model-invocation: true"
+  related:
+    - user-invocable
+  gotchas:
+    - "When set, the skill will not appear in the model's tool list — it is user-only."
+    - "Pair with user-invocable: true to make intent explicit."
+
+- name: user-invocable
+  category: frontmatter
+  description: Marks the skill as invocable by the user via a slash command in addition to model invocation.
+  usage: "user-invocable: true"
+  examples:
+    - "user-invocable: true"
+  related:
+    - disable-model-invocation
+  gotchas:
+    - "If user-invocable is false and disable-model-invocation is true, the skill is effectively unreachable."
+
+- name: when-to-use
+  category: frontmatter
+  description: Natural-language description of the conditions under which the model should invoke this skill automatically.
+  usage: "when-to-use: <description>"
+  examples:
+    - "when-to-use: When the user asks to simplify or refactor code after completing a feature."
+    - "when-to-use: When code imports anthropic or @anthropic-ai/sdk."
+  related:
+    - description
+    - disable-model-invocation
+  gotchas:
+    - "This field guides auto-invocation — be specific to avoid the model triggering the skill at wrong times."
+
+- name: hooks
+  category: frontmatter
+  description: Defines lifecycle hook bindings scoped to this skill or agent, executed at the specified hook events.
+  usage: "hooks: { <event>: [<handler>] }"
+  examples:
+    - "hooks: { SessionStart: [ { type: command, command: echo ready } ] }"
+  related:
+    - command
+    - shell
+  gotchas:
+    - "Frontmatter hooks are scoped to this skill/agent — global hooks are configured in settings.json."
+
+- name: shell
+  category: frontmatter
+  description: Specifies the shell interpreter to use when executing command entries for this skill or agent.
+  usage: "shell: <shell-path>"
+  examples:
+    - "shell: /bin/bash"
+    - "shell: /bin/zsh"
+  related:
+    - command
+  gotchas:
+    - "Defaults to the system shell if omitted."
+
+- name: mcpServers
+  category: frontmatter
+  description: Declares MCP server dependencies for this skill or agent, ensuring they are available when the file is loaded.
+  usage: "mcpServers: [<server-name>, ...]"
+  examples:
+    - "mcpServers: [postgres, filesystem]"
+  related:
+    - allowed-tools
+    - agent
+  gotchas:
+    - "MCP server names must match entries in the relevant settings.json mcpServers block."
+    - "CC does not auto-start MCP servers — they must already be configured and running."
