@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -151,22 +152,82 @@ func runDaemonStart(stdout, stderr io.Writer) int {
 	return 0
 }
 
-// runDaemonStop reads the PID file, sends SIGTERM, and polls for exit up to 5s.
+// runDaemonStop reads the PID file, verifies the daemon is alive and matches,
+// sends SIGTERM, and polls for exit up to 5s.
+//
+// Security hardening (Elliot review F1/F2):
+//   - Lstat + O_NOFOLLOW prevents a symlink at the PID path from redirecting the
+//     read to an arbitrary file (mirrors daemon's writePIDFile pattern).
+//   - We dial the daemon's /status endpoint before signaling. If it returns
+//     ErrDaemonUnavailable the daemon is already gone — we clean up and exit 0.
+//     If status.PID differs from the file, we refuse — PID file is stale or
+//     tampered, and signaling would hit a victim process.
+//   - After SIGTERM we call /status once more. If it returns ErrDaemonUnavailable
+//     the daemon received the signal and exited. If it succeeds with a *different*
+//     PID the kernel reused the PID — we must not re-signal (F2 race mitigation).
+//     The race is unmitigatable on macOS without kernel-level pidfd semantics;
+//     a code comment documents this rather than pretending it is fully closed.
 func runDaemonStop(stdout, stderr io.Writer) int {
 	pidPath := config.CcmcDaemonPidPath()
-	data, err := os.ReadFile(pidPath)
-	if os.IsNotExist(err) {
-		fmt.Fprintln(stdout, "no daemon running")
-		return 0
+
+	// Symlink guard: refuse if the PID path is a symlink, mirroring the daemon's
+	// writePIDFile. Any Lstat error other than ENOENT is also surfaced — it is
+	// unexpected and should not be silently swallowed.
+	fi, lstatErr := os.Lstat(pidPath)
+	if lstatErr != nil {
+		if os.IsNotExist(lstatErr) {
+			fmt.Fprintln(stdout, "no daemon running")
+			return 0
+		}
+		fmt.Fprintf(stderr, "ccmc daemon stop: stat PID file: %v\n", lstatErr)
+		return 1
 	}
-	if err != nil {
-		fmt.Fprintf(stderr, "ccmc daemon stop: read PID file: %v\n", err)
+	if fi.Mode().Type()&os.ModeSymlink != 0 {
+		fmt.Fprintf(stderr, "ccmc daemon stop: PID file %s is a symlink — refusing\n", pidPath)
 		return 1
 	}
 
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || pid <= 0 {
+	// Open with O_NOFOLLOW so the kernel refuses if a symlink races into place
+	// between our Lstat check and this open.
+	f, err := os.OpenFile(pidPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintln(stdout, "no daemon running")
+			return 0
+		}
+		fmt.Fprintf(stderr, "ccmc daemon stop: open PID file: %v\n", err)
+		return 1
+	}
+	buf := make([]byte, 32)
+	n, _ := f.Read(buf)
+	f.Close()
+
+	pid, parseErr := strconv.Atoi(strings.TrimSpace(string(buf[:n])))
+	if parseErr != nil || pid <= 0 {
 		fmt.Fprintf(stderr, "ccmc daemon stop: invalid PID in %s\n", pidPath)
+		return 1
+	}
+
+	// Dial the daemon before signaling. If it is already gone we treat that as
+	// "no daemon running" and remove the stale PID file. If it is alive we
+	// compare its self-reported PID to the file — a mismatch means the file is
+	// stale or tampered and we refuse to signal.
+	client := ccmc.NewClient(ccmc.WithTimeout(2 * time.Second))
+	ds, statusErr := client.Status()
+	if statusErr != nil {
+		if errors.Is(statusErr, ccmc.ErrDaemonUnavailable) {
+			// Daemon socket is gone — PID file is stale. Remove and exit cleanly.
+			os.Remove(pidPath)
+			fmt.Fprintln(stdout, "no daemon running")
+			return 0
+		}
+		fmt.Fprintf(stderr, "ccmc daemon stop: query status: %v\n", statusErr)
+		return 1
+	}
+	if ds.PID != pid {
+		fmt.Fprintf(stderr,
+			"ccmc daemon stop: PID file mismatch (file=%d daemon=%d) — refusing to signal; remove %s manually if you trust it\n",
+			pid, ds.PID, pidPath)
 		return 1
 	}
 
@@ -183,6 +244,25 @@ func runDaemonStop(stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintf(stderr, "ccmc daemon stop: signal: %v\n", err)
 		return 1
+	}
+
+	// Post-signal liveness check (F2 race mitigation): a SIGTERM at T+0 and a
+	// PID reuse at T+1ms are undetectable on macOS without pidfd_open. We call
+	// Status() once immediately after signaling. If the daemon is gone
+	// (ErrDaemonUnavailable) we treat that as success. If Status() returns a
+	// *different* PID the kernel reused the slot — we must not re-signal.
+	// This race window is acknowledged and unmitigatable without daemon-side
+	// sentinels (e.g. a generation nonce in the status response).
+	ds2, postErr := client.Status()
+	if postErr != nil && errors.Is(postErr, ccmc.ErrDaemonUnavailable) {
+		// Daemon is gone — SIGTERM succeeded.
+		fmt.Fprintln(stdout, "daemon stopped")
+		return 0
+	}
+	if postErr == nil && ds2.PID != pid {
+		// PID was reused after our SIGTERM — do not re-signal the new process.
+		fmt.Fprintln(stdout, "daemon stopped")
+		return 0
 	}
 
 	// Poll for process exit up to 5s.
@@ -421,7 +501,7 @@ func runSetup(stdout, stderr io.Writer) int {
 
 	// ── 2. Write default config.yaml if missing ───────────────────────────────
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		if err := os.WriteFile(configPath, []byte(defaultConfigYAML), 0o600); err != nil {
+		if err := writeAtomicFile(configPath, []byte(defaultConfigYAML), 0o600); err != nil {
 			fmt.Fprintf(stderr, "ccmc setup: write config.yaml: %v\n", err)
 			return 1
 		}
@@ -462,6 +542,43 @@ func runSetup(stdout, stderr io.Writer) int {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// writeAtomicFile writes data to dst by first writing to a temp file in the same
+// directory, then calling os.Rename. This ensures dst is never partially written
+// even if the process is killed mid-write (mirrors hooks/installer.go writeAtomic).
+func writeAtomicFile(dst string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(dst)
+	f, err := os.CreateTemp(dir, ".ccmc-tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := f.Name()
+
+	if err := f.Chmod(perm); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("sync temp file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("rename temp to %s: %w", dst, err)
+	}
+	return nil
 }
 
 // waitForSocket polls socketPath every 50 ms until the file appears or deadline.

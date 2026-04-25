@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -215,7 +217,11 @@ func (c *Client) get(path string, dst any) error {
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(dst); err != nil {
-		return fmt.Errorf("api: decode response from %s: %w", path, err)
+		// A daemon returning malformed JSON is functionally unavailable — the
+		// caller cannot use the response. Wrapping as ErrDaemonUnavailable lets
+		// callers (e.g. ccmc ls) fall through to filesystem mode rather than
+		// surfacing a confusing decode error to the user.
+		return fmt.Errorf("%w: decode response from %s: %v", ErrDaemonUnavailable, path, err)
 	}
 	return nil
 }
@@ -286,6 +292,10 @@ func StartDaemon() error {
 // so the Client can supply a test-binary path and an explicit socket path during
 // testing. Production callers should use StartDaemon.
 //
+// WithBinaryPath is test-only. It must NOT be wired from user-controllable config
+// (e.g. binary_path in config.yaml) without re-reviewing the path validation below
+// — a writable config file combined with a user-controlled path would be RCE.
+//
 // Coupling note: the child is invoked as:
 //
 //	<binaryPath> daemonAutoStartSubcommand
@@ -295,6 +305,28 @@ func StartDaemon() error {
 func StartDaemonWithBinary(binaryPath, socketPath string) error {
 	if binaryPath == "" {
 		return fmt.Errorf("auto-start: cannot determine binary path (os.Args[0] is empty)")
+	}
+
+	// Validate the binary path before exec to prevent privilege-confused or
+	// attacker-redirected execution. Same-uid writes to config.yaml must not
+	// translate to arbitrary code execution via this fork path.
+	if !filepath.IsAbs(binaryPath) {
+		return fmt.Errorf("auto-start: binary path must be absolute, got %q", binaryPath)
+	}
+	fi, err := os.Lstat(binaryPath)
+	if err != nil {
+		return fmt.Errorf("auto-start: stat binary %q: %w", binaryPath, err)
+	}
+	if fi.Mode().Type()&os.ModeSymlink != 0 {
+		return fmt.Errorf("auto-start: binary path %q is a symlink — refusing", binaryPath)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("auto-start: binary path %q is not a regular file", binaryPath)
+	}
+	if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+		if stat.Uid != uint32(os.Getuid()) {
+			return fmt.Errorf("auto-start: binary path %q is not owned by current user", binaryPath)
+		}
 	}
 
 	logPath, err := daemonLogPath()
@@ -315,6 +347,12 @@ func StartDaemonWithBinary(binaryPath, socketPath string) error {
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
+
+	// Pass an explicit allowlist to the child instead of inheriting the full parent
+	// environment. Inheriting everything exposes LD_PRELOAD, DYLD_INSERT_LIBRARIES,
+	// hostile PATH segments, and unrelated secrets. The daemon only needs these
+	// vars to locate its own directories and behave correctly on macOS/Linux.
+	cmd.Env = buildDaemonEnv()
 
 	// Detach from the current process group and terminal so the daemon is not a
 	// child of the CLI invocation. On macOS/Linux, Setsid creates a new session;
@@ -341,6 +379,54 @@ func StartDaemonWithBinary(binaryPath, socketPath string) error {
 	}
 
 	return nil
+}
+
+// buildDaemonEnv constructs the explicit environment passed to the daemon child
+// process. Only the vars the daemon actually needs are forwarded; everything else
+// — including LD_PRELOAD, DYLD_INSERT_LIBRARIES, hostile PATH entries, and
+// unrelated secrets — is dropped to prevent environment-based privilege confusion.
+// CCMC_DIR and CLAUDE_CONFIG_DIR are included so test overrides propagate correctly.
+// CCMC_TEST_DAEMON_SOCKET is forwarded when set so the api_test auto-start helper
+// can locate its socket; in production this var is unset so it adds no surface.
+func buildDaemonEnv() []string {
+	allowed := allowedDaemonEnvKeys
+	env := make([]string, 0, len(allowed))
+	for _, key := range allowed {
+		if val, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+val)
+		}
+	}
+	return env
+}
+
+// allowedDaemonEnvKeys is the complete allowlist forwarded to the daemon child.
+// Keeping it here (rather than inlined in buildDaemonEnv) lets tests verify the
+// list without duplicating it. Extend here when new CCMC_* vars are added.
+var allowedDaemonEnvKeys = []string{
+	"HOME", "PATH", "USER", "LOGNAME", "TMPDIR", "SHELL",
+	"CCMC_DIR", "CLAUDE_CONFIG_DIR",
+	// Forwarded only when set — used by api_test auto-start helper to locate the
+	// test socket. Never set in production deployments.
+	"CCMC_TEST_DAEMON_SOCKET",
+}
+
+// BuildDaemonEnvForTest exposes buildDaemonEnv for white-box testing.
+func BuildDaemonEnvForTest() []string { return buildDaemonEnv() }
+
+// AllowedDaemonEnvKeys returns the allowlist used by buildDaemonEnv so tests
+// can verify the result without hard-coding the list a second time.
+func AllowedDaemonEnvKeys() []string {
+	out := make([]string, len(allowedDaemonEnvKeys))
+	copy(out, allowedDaemonEnvKeys)
+	return out
+}
+
+// splitEnvKey returns the key portion of a "KEY=VALUE" string.
+func splitEnvKey(kv string) string {
+	if i := strings.IndexByte(kv, '='); i >= 0 {
+		return kv[:i]
+	}
+	return kv
 }
 
 // waitForSocket polls os.Stat on socketPath every 50 ms until the file appears

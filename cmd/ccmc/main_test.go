@@ -2,11 +2,76 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"net/http"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
+
+	"ccmc/internal/config"
+	"ccmc/internal/daemon"
+	"ccmc/internal/hooks"
+	"ccmc/pkg/ccmc"
 )
+
+// TestMain detects when the test binary is re-invoked as a daemon helper and
+// runs a real daemon on the socket path given by CCMC_DIR. This supports
+// TestDaemonStop_PostSIGTERMVerify, which needs an out-of-process daemon so
+// that SIGTERM goes to a child process, not the test process itself.
+func TestMain(m *testing.M) {
+	if os.Getenv("CCMC_TEST_RUN_DAEMON") == "1" {
+		runEmbeddedTestDaemon()
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
+
+// runEmbeddedTestDaemon starts a real daemon on the config-standard paths
+// (derived from CCMC_DIR) and runs until SIGTERM or idle timeout.
+func runEmbeddedTestDaemon() {
+	sockPath := config.CcmcSocketPath()
+	pidPath := config.CcmcDaemonPidPath()
+	dir := config.CcmcDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		os.Stderr.WriteString("ccmc test daemon: mkdir: " + err.Error() + "\n")
+		os.Exit(1)
+	}
+
+	reg := daemon.NewRegistry(dir + "/r.json")
+	srv := daemon.New(reg, embeddedTestHookHandlers(reg),
+		daemon.WithSocketPath(sockPath),
+		daemon.WithPIDPath(pidPath),
+		daemon.WithIdleTimeout(10*time.Second),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() { <-sigCh; cancel() }()
+
+	if err := srv.Run(ctx); err != nil {
+		os.Stderr.WriteString("ccmc test daemon: " + err.Error() + "\n")
+		os.Exit(1)
+	}
+}
+
+func embeddedTestHookHandlers(reg *daemon.Registry) map[string]http.HandlerFunc {
+	return map[string]http.HandlerFunc{
+		"SessionStart":  hooks.HandleSessionStart(reg),
+		"SessionEnd":    hooks.HandleSessionEnd(reg),
+		"PostToolUse":   hooks.HandlePostToolUse(reg),
+		"SubagentStart": hooks.HandleSubagentStart(reg),
+		"SubagentStop":  hooks.HandleSubagentStop(reg),
+		"Stop":          hooks.HandleStop(reg),
+		"Notification":  hooks.HandleNotification(reg),
+	}
+}
 
 // runRefOut is a test helper that runs runRef with the given arguments and
 // returns the captured stdout, captured stderr, and exit code.
@@ -386,4 +451,315 @@ func TestSetup_AlreadySetUpMessage(t *testing.T) {
 	if !strings.Contains(out, "already set up") {
 		t.Errorf("expected 'already set up' message on second run, got: %q", out)
 	}
+}
+
+// TestSetup_NoTmpFileAfterSuccess verifies F5: atomic write leaves no .ccmc-tmp-*
+// file behind after a successful setup.
+func TestSetup_NoTmpFileAfterSuccess(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+
+	_, _, code := runCmd([]string{"setup"})
+	if code != 0 {
+		t.Fatalf("setup: expected exit 0, got %d", code)
+	}
+
+	entries, err := os.ReadDir(tmp)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".ccmc-tmp-") {
+			t.Errorf("found leftover temp file after setup: %s", e.Name())
+		}
+	}
+}
+
+// ── daemon stop security tests (F1 / F2) ─────────────────────────────────────
+
+// testHookHandlers returns the hook handler map needed to start a test daemon.
+func testHookHandlers(reg *daemon.Registry) map[string]http.HandlerFunc {
+	return map[string]http.HandlerFunc{
+		"SessionStart":  hooks.HandleSessionStart(reg),
+		"SessionEnd":    hooks.HandleSessionEnd(reg),
+		"PostToolUse":   hooks.HandlePostToolUse(reg),
+		"SubagentStart": hooks.HandleSubagentStart(reg),
+		"SubagentStop":  hooks.HandleSubagentStop(reg),
+		"Stop":          hooks.HandleStop(reg),
+		"Notification":  hooks.HandleNotification(reg),
+	}
+}
+
+// startTestDaemon boots a real daemon in a background goroutine using the
+// config-standard socket and PID paths derived from CCMC_DIR (which callers
+// must set via t.Setenv before calling). This ensures runDaemonStop, which
+// calls config.CcmcSocketPath() and config.CcmcDaemonPidPath(), dials the
+// same socket and reads the same PID file the daemon wrote.
+//
+// dir must be a short path (≤ ~90 chars) to satisfy macOS's 104-byte SUN_LEN
+// socket path limit. Use os.MkdirTemp("", "ccmc") — NOT t.TempDir() whose
+// long test-name prefix can push the socket path over the limit.
+func startTestDaemon(t *testing.T, dir string) (*daemon.Server, context.CancelFunc, <-chan error) {
+	t.Helper()
+	sockPath := filepath.Join(dir, "ccmc.sock")
+	pidPath := filepath.Join(dir, "daemon.pid")
+
+	reg := daemon.NewRegistry(filepath.Join(dir, "r.json"))
+	srv := daemon.New(reg, testHookHandlers(reg),
+		daemon.WithSocketPath(sockPath),
+		daemon.WithPIDPath(pidPath),
+		daemon.WithIdleTimeout(30*time.Minute),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan error, 1)
+	go func() { ch <- srv.Run(ctx) }()
+
+	// Poll until the socket is present.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(sockPath); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(sockPath); err != nil {
+		cancel()
+		t.Fatalf("test daemon did not create socket within 3s: %v", err)
+	}
+	return srv, cancel, ch
+}
+
+// TestDaemonStop_PIDSymlinkRefused verifies F1: when the PID file is a symlink,
+// daemon stop refuses and the symlink target is untouched.
+func TestDaemonStop_PIDSymlinkRefused(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+
+	// Create an innocent target file and plant a symlink where the PID file lives.
+	target := filepath.Join(tmp, "innocent-target")
+	if err := os.WriteFile(target, []byte("do not touch\n"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	pidPath := filepath.Join(tmp, "daemon.pid")
+	if err := os.Symlink(target, pidPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	_, errOut, code := runCmd([]string{"daemon", "stop"})
+	if code != 1 {
+		t.Fatalf("expected exit 1 for symlink PID file, got %d; stderr: %q", code, errOut)
+	}
+	if !strings.Contains(errOut, "symlink") {
+		t.Errorf("expected 'symlink' in stderr, got: %q", errOut)
+	}
+
+	// The target must be untouched.
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target after stop: %v", err)
+	}
+	if string(data) != "do not touch\n" {
+		t.Errorf("symlink target was modified: got %q", string(data))
+	}
+}
+
+// TestDaemonStop_PIDMismatchRefused verifies F1: when the PID file contains a
+// different PID than the daemon reports, daemon stop refuses with a clear error
+// without signaling anything.
+//
+// The daemon runs in-process (goroutine) so its self-reported PID is
+// os.Getpid(). We plant PID 1 (launchd — always alive but never our daemon)
+// in the PID file. The mismatch is detected before any signal is sent, so
+// launchd is never signaled and the test process is never at risk.
+func TestDaemonStop_PIDMismatchRefused(t *testing.T) {
+	// Use os.MkdirTemp for a short path — t.TempDir() names are too long for macOS's
+	// 104-byte unix socket path limit.
+	tmp, err := os.MkdirTemp("", "ccmc")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(tmp) })
+	t.Setenv("CCMC_DIR", tmp)
+
+	// Start a real daemon in-process so the status dial succeeds and returns a
+	// PID (os.Getpid()). Its PID file is written at config.CcmcDaemonPidPath().
+	_, cancel, done := startTestDaemon(t, tmp)
+	defer func() { cancel(); <-done }()
+
+	// Overwrite the PID file with PID 1 — always alive, always differs from
+	// os.Getpid(), and runDaemonStop will refuse before signaling because
+	// the mismatch is caught before proc.Signal().
+	pidPath := filepath.Join(tmp, "daemon.pid")
+	if err := os.WriteFile(pidPath, []byte("1\n"), 0o600); err != nil {
+		t.Fatalf("write fake PID file: %v", err)
+	}
+
+	// Install a SIGTERM handler as a safety net: if the mismatch check is
+	// broken and SIGTERM is sent to any process, we want to know.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	_, errOut, code := runCmd([]string{"daemon", "stop"})
+	if code != 1 {
+		t.Fatalf("expected exit 1 for PID mismatch, got %d; stderr: %q", code, errOut)
+	}
+	if !strings.Contains(errOut, "PID file mismatch") {
+		t.Errorf("expected 'PID file mismatch' in stderr, got: %q", errOut)
+	}
+
+	// The test process must not have received SIGTERM.
+	select {
+	case <-sigCh:
+		t.Error("test process received SIGTERM — daemon stop signaled the wrong PID")
+	default:
+	}
+}
+
+// TestDaemonStop_StalePIDNoSocket verifies F1: when the PID file points to a
+// dead PID and no daemon socket is present, daemon stop prints "no daemon
+// running", removes the stale PID file, and exits 0.
+func TestDaemonStop_StalePIDNoSocket(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+
+	// Write a PID that is guaranteed dead: PID 1 is init (never our daemon),
+	// but a more reliable dead PID is to use a negative value. Instead, use
+	// /bin/sh's approach: find a PID that cannot exist. On macOS PID_MAX is
+	// 99999. We write PID 2 which on macOS/Linux is either kernel or launchd —
+	// the dial to our (absent) socket will fail regardless, so Status() returns
+	// ErrDaemonUnavailable and we remove the file.
+	pidPath := filepath.Join(tmp, "daemon.pid")
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid()+99999)+"\n"), 0o600); err != nil {
+		t.Fatalf("write stale PID file: %v", err)
+	}
+
+	out, _, code := runCmd([]string{"daemon", "stop"})
+	if code != 0 {
+		t.Fatalf("expected exit 0 for stale PID, got %d; stdout: %q", code, out)
+	}
+	if !strings.Contains(out, "no daemon running") {
+		t.Errorf("expected 'no daemon running' in stdout, got: %q", out)
+	}
+
+	// PID file must be removed.
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Errorf("stale PID file was not removed after daemon stop")
+	}
+}
+
+// TestDaemonStop_PostSIGTERMVerify verifies F2: starting a real out-of-process
+// daemon and running daemon stop returns exit 0 and the daemon is gone.
+//
+// The daemon is a subprocess (re-invocation of the test binary via TestMain
+// with CCMC_TEST_RUN_DAEMON=1) so that SIGTERM from runDaemonStop targets the
+// child process, not the test process. An in-process goroutine cannot be used
+// here because proc.Signal(SIGTERM) with the test-process PID would terminate
+// the entire test run.
+func TestDaemonStop_PostSIGTERMVerify(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	// Use os.MkdirTemp for a short path to satisfy macOS's 104-byte socket limit.
+	tmp, err2 := os.MkdirTemp("", "ccmc")
+	if err2 != nil {
+		t.Fatalf("MkdirTemp: %v", err2)
+	}
+	t.Cleanup(func() { os.RemoveAll(tmp) })
+	t.Setenv("CCMC_DIR", tmp)
+
+	sockPath := filepath.Join(tmp, "ccmc.sock")
+	client := ccmc.NewClient(ccmc.WithSocketPath(sockPath), ccmc.WithTimeout(2*time.Second))
+
+	// Fork the daemon subprocess: re-invoke the test binary with CCMC_TEST_RUN_DAEMON=1.
+	// The child binds on config-standard paths (derived from CCMC_DIR=tmp).
+	// We do NOT call Release() so that daemonCmd.Wait() in the goroutine below reaps
+	// the zombie promptly after the child exits. This allows the proc.Signal(0) poll
+	// loop in runDaemonStop to see ESRCH (process gone) after the zombie is reaped.
+	// If we called Release(), the zombie would persist until init reaps it, and the
+	// poll loop would spin for up to 5s without seeing ESRCH.
+	daemonCmd := buildDaemonHelperCmd(exe, tmp)
+	if err := daemonCmd.Start(); err != nil {
+		t.Fatalf("start daemon subprocess: %v", err)
+	}
+	// Goroutine to reap the child promptly when it exits, so the poll loop in
+	// runDaemonStop sees ESRCH quickly after SIGTERM is processed. The goroutine
+	// is buffered so it can complete without blocking if nobody reads procDone.
+	procDone := make(chan struct{})
+	go func() {
+		_ = daemonCmd.Wait()
+		close(procDone)
+	}()
+	t.Cleanup(func() {
+		// Safety net: kill the child if still running.
+		_ = daemonCmd.Process.Kill()
+		// Give the Wait goroutine up to 2s to reap the child.
+		select {
+		case <-procDone:
+		case <-time.After(2 * time.Second):
+			// Best-effort — the test is done anyway.
+		}
+	})
+
+	// Wait for the socket to appear (up to 3s).
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(sockPath); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(sockPath); err != nil {
+		t.Fatalf("daemon subprocess did not create socket within 3s")
+	}
+
+	// Confirm the daemon is alive via the client.
+	if _, err := client.Status(); err != nil {
+		t.Fatalf("daemon not alive before stop: %v", err)
+	}
+
+	// daemon stop must succeed.
+	out, errOut, code := runCmd([]string{"daemon", "stop"})
+	if code != 0 {
+		t.Fatalf("daemon stop: expected exit 0, got %d; stdout: %q stderr: %q", code, out, errOut)
+	}
+	if !strings.Contains(out, "daemon stopped") {
+		t.Errorf("expected 'daemon stopped' in stdout, got: %q", out)
+	}
+
+	// Wait for the subprocess to be reaped (the goroutine closes procDone after
+	// Wait() returns, which happens after SIGTERM from runDaemonStop).
+	select {
+	case <-procDone:
+	case <-time.After(6 * time.Second):
+		t.Error("daemon subprocess did not exit within 6s after stop")
+	}
+
+	// The daemon must no longer be reachable.
+	if _, err := client.Status(); err == nil {
+		t.Error("daemon still reachable after daemon stop")
+	}
+}
+
+// buildDaemonHelperCmd returns an exec.Cmd that re-invokes the current test
+// binary as a daemon subprocess. The child detects CCMC_TEST_RUN_DAEMON=1 in
+// TestMain and runs a real daemon on the config-standard paths under dir.
+// stdout/stderr are explicitly redirected to os.DevNull so that the subprocess
+// does not inherit the test harness's I/O pipes — an inherited pipe would block
+// cmd.Wait() from returning until the child's inherited pipe end closes.
+func buildDaemonHelperCmd(exe, dir string) *exec.Cmd {
+	devnull, _ := os.Open(os.DevNull)
+	cmd := exec.Command(exe, "-test.run=^$") //nolint:gosec — exe is os.Executable()
+	cmd.Env = append(os.Environ(),
+		"CCMC_TEST_RUN_DAEMON=1",
+		"CCMC_DIR="+dir,
+	)
+	cmd.Stdout = devnull
+	cmd.Stderr = devnull
+	cmd.Stdin = devnull
+	return cmd
 }

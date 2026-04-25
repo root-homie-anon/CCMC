@@ -423,6 +423,165 @@ func TestStartDaemon_NonExistentBinary(t *testing.T) {
 	}
 }
 
+// ─── F3: binary path validation ──────────────────────────────────────────────
+
+// TestStartDaemonWithBinary_RelativePath verifies that a non-absolute path is
+// rejected before any stat or exec call.
+func TestStartDaemonWithBinary_RelativePath(t *testing.T) {
+	err := ccmc.StartDaemonWithBinary("relative/path/binary", "/tmp/nonexistent.sock")
+	if err == nil {
+		t.Fatal("expected error for relative path, got nil")
+	}
+	if !containsStr(err.Error(), "absolute") {
+		t.Errorf("error = %q, want mention of 'absolute'", err.Error())
+	}
+}
+
+// TestStartDaemonWithBinary_SymlinkBinary verifies that a symlink at the binary
+// path is rejected to prevent an attacker from redirecting the exec target.
+func TestStartDaemonWithBinary_SymlinkBinary(t *testing.T) {
+	dir := t.TempDir()
+	// Create a real target file so the symlink resolves.
+	target := filepath.Join(dir, "real-binary")
+	if err := os.WriteFile(target, []byte("#!/bin/sh"), 0o755); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	link := filepath.Join(dir, "link-binary")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	err := ccmc.StartDaemonWithBinary(link, "/tmp/nonexistent.sock")
+	if err == nil {
+		t.Fatal("expected error for symlink binary, got nil")
+	}
+	if !containsStr(err.Error(), "symlink") {
+		t.Errorf("error = %q, want mention of 'symlink'", err.Error())
+	}
+}
+
+// TestStartDaemonWithBinary_DirectoryPath verifies that a directory is rejected
+// (binary path must be a regular file).
+func TestStartDaemonWithBinary_DirectoryPath(t *testing.T) {
+	dir := t.TempDir()
+	err := ccmc.StartDaemonWithBinary(dir, "/tmp/nonexistent.sock")
+	if err == nil {
+		t.Fatal("expected error for directory path, got nil")
+	}
+	if !containsStr(err.Error(), "regular file") {
+		t.Errorf("error = %q, want mention of 'regular file'", err.Error())
+	}
+}
+
+// ─── F4: env allowlist ────────────────────────────────────────────────────────
+
+// TestBuildDaemonEnv_AllowlistOnly verifies that buildDaemonEnv returns only
+// the declared allowed keys — no LD_PRELOAD, no hostile extras — and that every
+// entry is in KEY=VALUE form.
+func TestBuildDaemonEnv_AllowlistOnly(t *testing.T) {
+	// Plant a hostile variable that must not appear in the child env.
+	t.Setenv("LD_PRELOAD", "/evil/lib.so")
+	t.Setenv("DYLD_INSERT_LIBRARIES", "/evil/dylib.dylib")
+	t.Setenv("CCMC_SHOULD_NOT_LEAK", "secret-value")
+
+	env := ccmc.BuildDaemonEnvForTest()
+	allowed := ccmc.AllowedDaemonEnvKeys()
+	allowedSet := make(map[string]bool, len(allowed))
+	for _, k := range allowed {
+		allowedSet[k] = true
+	}
+
+	for _, kv := range env {
+		idx := 0
+		for idx < len(kv) && kv[idx] != '=' {
+			idx++
+		}
+		key := kv[:idx]
+		if !allowedSet[key] {
+			t.Errorf("buildDaemonEnv returned unexpected key %q", key)
+		}
+	}
+
+	// The hostile keys must not appear at all.
+	for _, kv := range env {
+		if containsStr(kv, "LD_PRELOAD") || containsStr(kv, "DYLD_INSERT_LIBRARIES") || containsStr(kv, "CCMC_SHOULD_NOT_LEAK") {
+			t.Errorf("buildDaemonEnv leaked hostile env entry: %q", kv)
+		}
+	}
+}
+
+// TestBuildDaemonEnv_KeysPresent verifies that when allowed keys are set in the
+// environment, buildDaemonEnv includes them with the correct value.
+func TestBuildDaemonEnv_KeysPresent(t *testing.T) {
+	t.Setenv("CCMC_DIR", "/test/ccmc-dir")
+	env := ccmc.BuildDaemonEnvForTest()
+	found := false
+	for _, kv := range env {
+		if kv == "CCMC_DIR=/test/ccmc-dir" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("buildDaemonEnv did not include CCMC_DIR=/test/ccmc-dir; got: %v", env)
+	}
+}
+
+// ─── F8: decode error wraps as ErrDaemonUnavailable ─────────────────────────
+
+// TestClient_DecodeError_ReturnsErrDaemonUnavailable verifies that when the
+// daemon returns a 200 response with malformed JSON, the client wraps the error
+// as ErrDaemonUnavailable so callers can fall through to filesystem mode.
+func TestClient_DecodeError_ReturnsErrDaemonUnavailable(t *testing.T) {
+	dir, err := os.MkdirTemp("", "ccmc")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sockPath := filepath.Join(dir, "stub.sock")
+
+	// Stub server that returns 200 with malformed JSON on every request.
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sessions", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{not valid json`))
+	})
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{not valid json`))
+	})
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { srv.Close() })
+
+	c := ccmc.NewClient(
+		ccmc.WithSocketPath(sockPath),
+		ccmc.WithTimeout(2*time.Second),
+	)
+
+	_, err = c.ListSessions()
+	if err == nil {
+		t.Fatal("ListSessions with malformed JSON: expected error, got nil")
+	}
+	if !errors.Is(err, ccmc.ErrDaemonUnavailable) {
+		t.Errorf("ListSessions malformed JSON: got %v, want ErrDaemonUnavailable", err)
+	}
+
+	_, err = c.Status()
+	if err == nil {
+		t.Fatal("Status with malformed JSON: expected error, got nil")
+	}
+	if !errors.Is(err, ccmc.ErrDaemonUnavailable) {
+		t.Errorf("Status malformed JSON: got %v, want ErrDaemonUnavailable", err)
+	}
+}
+
 // ─── go vet / build check for unused import ───────────────────────────────────
 
 // Ensure exec is used (imported for TestMain daemon helper command checks).
