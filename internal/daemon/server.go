@@ -3,12 +3,15 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -38,6 +41,11 @@ type Server struct {
 	// lastActivity is updated atomically on every inbound request so the idle
 	// timer does not require the main goroutine to hold a lock during checks.
 	lastActivity atomic.Int64 // unix nano
+
+	// inFlight counts requests currently executing inside a handler. The idle
+	// shutdown check refuses to fire while this is non-zero so a freshly-started
+	// handler cannot be raced by a concurrent idle tick.
+	inFlight atomic.Int32
 }
 
 // Option is a functional option for Server construction.
@@ -118,15 +126,15 @@ func New(reg *Registry, hookHandlers map[string]http.HandlerFunc, opts ...Option
 // SIGTERM/SIGINT handling lives here so the daemon works standalone without a
 // wrapper CLI command.
 func (s *Server) Run(ctx context.Context) error {
-	// ── 1. Stale socket cleanup ──────────────────────────────────────────────
-	if err := s.clearStaleSocket(); err != nil {
+	// ── 0. Verify ~/.ccmc/ directory integrity ────────────────────────────────
+	if err := verifyCcmcDir(filepath.Dir(s.socketPath)); err != nil {
 		return fmt.Errorf("daemon: %w", err)
 	}
 
-	// ── 2. Bind listener ─────────────────────────────────────────────────────
-	ln, err := net.Listen("unix", s.socketPath)
+	// ── 1. Bind listener (with TOCTOU-aware stale-socket handling) ───────────
+	ln, err := s.bindSocket()
 	if err != nil {
-		return fmt.Errorf("daemon: bind unix socket %s: %w", s.socketPath, err)
+		return fmt.Errorf("daemon: %w", err)
 	}
 	if err := os.Chmod(s.socketPath, 0o600); err != nil {
 		ln.Close()
@@ -142,7 +150,20 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// ── 4. HTTP server ───────────────────────────────────────────────────────
 	mux := s.buildMux()
-	srv := &http.Server{Handler: s.activityMiddleware(mux)}
+	// Timeouts defend against slowloris and a hostile same-uid process that
+	// holds a connection open. MaxHeaderBytes caps header allocation before the
+	// body is even read (body caps are enforced per-handler via MaxBytesReader).
+	// Note: stdlib http.Server recovers from per-connection panics internally
+	// (net/http server.go conn.serve), so handler panics will not crash the
+	// daemon — stale socket/PID cleanup at next startup handles SIGKILL.
+	srv := &http.Server{
+		Handler:           s.activityMiddleware(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 14, // 16 KiB
+	}
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -265,11 +286,13 @@ func (s *Server) buildMux() *http.ServeMux {
 	return mux
 }
 
-// activityMiddleware wraps the mux and updates lastActivity on every request so
-// the idle timer has a precise signal without polling the registry lock.
+// activityMiddleware wraps the mux, stamps lastActivity, and maintains the
+// inFlight counter so the idle-shutdown check never fires under a live handler.
 func (s *Server) activityMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.lastActivity.Store(time.Now().UnixNano())
+		s.inFlight.Add(1)
+		defer s.inFlight.Add(-1)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -316,10 +339,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, status)
 }
 
-// shouldIdleShutdown returns true when both conditions hold:
+// shouldIdleShutdown returns true when all three conditions hold:
+//  - No handler is currently executing (inFlight == 0).
 //  - No request has arrived within the idle timeout window.
 //  - No session is in an active state.
 func (s *Server) shouldIdleShutdown() bool {
+	if s.inFlight.Load() > 0 {
+		return false
+	}
 	lastNano := s.lastActivity.Load()
 	lastAct := time.Unix(0, lastNano)
 	if time.Since(lastAct) < s.idleTimeout {
@@ -333,52 +360,99 @@ func (s *Server) shouldIdleShutdown() bool {
 	return true
 }
 
-// clearStaleSocket removes the socket file at s.socketPath only when it is not
-// owned by a live listener. Detection: attempt to dial; success means a live
-// daemon is already bound there → refuse to start with an error. Dial failure
-// means the socket file is stale and safe to remove.
-func (s *Server) clearStaleSocket() error {
-	_, statErr := os.Stat(s.socketPath)
-	if os.IsNotExist(statErr) {
-		return nil // Clean start.
+// bindSocket binds the unix listener at s.socketPath using a TOCTOU-resistant
+// sequence: try net.Listen first; on EADDRINUSE, dial-check, and only if the
+// dial fails do we remove the stale file and retry once. This collapses the
+// old "stat → dial → remove → listen" window into a single listen-first path.
+//
+// Before attempting to bind, the socket path is checked with os.Lstat; if it
+// resolves to a symlink the daemon refuses to start — a same-uid attacker could
+// have placed the symlink to redirect socket creation to an arbitrary path.
+func (s *Server) bindSocket() (net.Listener, error) {
+	// Symlink guard: refuse to act on a symlink at the socket path.
+	if fi, err := os.Lstat(s.socketPath); err == nil {
+		if fi.Mode().Type()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("socket path %s is a symlink — refusing to start", s.socketPath)
+		}
 	}
 
-	conn, err := net.DialTimeout("unix", s.socketPath, 500*time.Millisecond)
+	// First attempt: bind directly.
+	ln, err := net.Listen("unix", s.socketPath)
 	if err == nil {
-		conn.Close()
-		return fmt.Errorf("a live daemon is already listening on %s — will not start", s.socketPath)
+		return ln, nil
 	}
 
-	// Dial failed: socket file exists but nothing is listening → stale. Remove.
-	if removeErr := os.Remove(s.socketPath); removeErr != nil && !os.IsNotExist(removeErr) {
-		return fmt.Errorf("failed to remove stale socket %s: %w", s.socketPath, removeErr)
+	// If the error is not EADDRINUSE, it is not recoverable.
+	if !errors.Is(err, syscall.EADDRINUSE) {
+		return nil, fmt.Errorf("bind unix socket %s: %w", s.socketPath, err)
 	}
-	return nil
+
+	// EADDRINUSE: something is at the path. Dial to check for a live listener.
+	log.Printf("daemon: socket path %s in use — checking for live daemon", s.socketPath)
+	conn, dialErr := net.DialTimeout("unix", s.socketPath, 500*time.Millisecond)
+	if dialErr == nil {
+		conn.Close()
+		return nil, fmt.Errorf("a live daemon is already listening on %s — will not start", s.socketPath)
+	}
+
+	// Dial failed: stale socket file. Remove and retry once.
+	log.Printf("daemon: stale socket detected at %s — removing", s.socketPath)
+	if removeErr := os.Remove(s.socketPath); removeErr != nil && !os.IsNotExist(removeErr) {
+		return nil, fmt.Errorf("failed to remove stale socket %s: %w", s.socketPath, removeErr)
+	}
+
+	ln, err = net.Listen("unix", s.socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("bind unix socket %s (after stale-remove): %w", s.socketPath, err)
+	}
+	return ln, nil
 }
 
 // writePIDFile checks whether an existing PID file names a live process that
 // owns our socket path. If it does, we refuse to start. If the PID is dead or
 // the socket check fails, we overwrite the PID file with our own PID.
+//
+// The PID path is checked with os.Lstat before writing; if it resolves to a
+// symlink the daemon refuses — a same-uid attacker could redirect the write to
+// an arbitrary file. The open uses O_NOFOLLOW so the kernel also refuses to
+// follow a symlink that races the Lstat check.
 func (s *Server) writePIDFile() error {
-	if data, err := os.ReadFile(s.pidPath); err == nil {
-		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
-		if parseErr == nil && pid > 0 {
-			if processIsAlive(pid) {
+	// Symlink guard: refuse if the PID path is already a symlink.
+	if fi, err := os.Lstat(s.pidPath); err == nil {
+		if fi.Mode().Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("PID path %s is a symlink — refusing to write", s.pidPath)
+		}
+	}
+
+	// Read existing PID file without following symlinks (O_NOFOLLOW).
+	if f, err := os.OpenFile(s.pidPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0); err == nil {
+		data, readErr := io.ReadAll(f)
+		f.Close()
+		if readErr == nil {
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+			if parseErr == nil && pid > 0 && processIsAlive(pid) {
 				// PID 1 is always alive but is never our daemon. For any PID,
-				// we already confirmed in clearStaleSocket that the socket has
-				// no live listener, so this is a stale PID from a crashed run.
-				// Overwrite rather than refusing — we log so the operator knows.
+				// we already confirmed in bindSocket that the socket has no live
+				// listener, so this is a stale PID from a crashed run. Overwrite
+				// rather than refusing — we log so the operator knows.
 				log.Printf("daemon: overwriting stale PID file (pid %d no longer owns socket)", pid)
 			}
 		}
 	}
 
-	if err := os.MkdirAll(s.pidPath[:strings.LastIndex(s.pidPath, "/")], 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.pidPath), 0o700); err != nil {
 		return fmt.Errorf("create PID dir: %w", err)
 	}
 
-	pidStr := strconv.Itoa(os.Getpid())
-	if err := os.WriteFile(s.pidPath, []byte(pidStr+"\n"), 0o600); err != nil {
+	// Open with O_NOFOLLOW so the kernel refuses if a symlink races into place
+	// between our Lstat check above and this open. 0o600 ensures only the
+	// owner can read the PID (no daemon-impersonation via world-readable PID).
+	f, err := os.OpenFile(s.pidPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return fmt.Errorf("write PID file %s: %w", s.pidPath, err)
+	}
+	defer f.Close()
+	if _, err := fmt.Fprintf(f, "%d\n", os.Getpid()); err != nil {
 		return fmt.Errorf("write PID file %s: %w", s.pidPath, err)
 	}
 	return nil
@@ -386,9 +460,15 @@ func (s *Server) writePIDFile() error {
 
 // removePIDFile removes the PID file if it still contains our own PID. This
 // prevents us from removing a PID file written by a replacement daemon that
-// started immediately after us.
+// started immediately after us. Reads via O_NOFOLLOW for consistency with the
+// write path — we do not chase a symlink that appeared after shutdown began.
 func (s *Server) removePIDFile() {
-	data, err := os.ReadFile(s.pidPath)
+	f, err := os.OpenFile(s.pidPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return
+	}
+	data, err := io.ReadAll(f)
+	f.Close()
 	if err != nil {
 		return
 	}
@@ -397,6 +477,35 @@ func (s *Server) removePIDFile() {
 		return
 	}
 	os.Remove(s.pidPath)
+}
+
+// verifyCcmcDir checks that dir (the ~/.ccmc directory) exists, is a real
+// directory (not a symlink), is owned by the current user, and has mode 0o700.
+// This runs at daemon startup before any socket or PID file operations so that
+// a misconfigured or attacker-controlled parent directory is caught early.
+func verifyCcmcDir(dir string) error {
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("stat ccmc dir %s: %w", dir, err)
+	}
+	if fi.Mode().Type()&os.ModeSymlink != 0 {
+		return fmt.Errorf("ccmc dir %s is a symlink — refusing to start", dir)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("ccmc dir %s is not a directory", dir)
+	}
+	// Owner check via platform Stat_t. On macOS/Linux, Uid is uint32.
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("ccmc dir %s: cannot read ownership info", dir)
+	}
+	if uint32(os.Getuid()) != stat.Uid {
+		return fmt.Errorf("ccmc dir %s is owned by uid %d, not current uid %d", dir, stat.Uid, os.Getuid())
+	}
+	if fi.Mode().Perm() != 0o700 {
+		return fmt.Errorf("ccmc dir %s has mode %04o, want 0700", dir, fi.Mode().Perm())
+	}
+	return nil
 }
 
 // processIsAlive sends signal 0 to the given PID. A nil error means the

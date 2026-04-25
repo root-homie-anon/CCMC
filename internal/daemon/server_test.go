@@ -1,6 +1,7 @@
 package daemon_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -411,6 +412,274 @@ func TestServer_IdleTimeout_ActiveSessionBlocks(t *testing.T) {
 	slurp(t, resp)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /status with active session: got %d, want 200 (active session should block idle shutdown)", resp.StatusCode)
+	}
+}
+
+// ─── H1: body size limit ─────────────────────────────────────────────────────
+
+// TestServer_HookBodyTooLarge verifies that a POST body exceeding the 1 MiB cap
+// returns 413 and that the server stays healthy for subsequent requests.
+func TestServer_HookBodyTooLarge(t *testing.T) {
+	reg := newReg(t)
+	s := newTestServer(t, reg, 30*time.Minute)
+	cancel, done := startServer(t, s)
+	defer func() { cancel(); <-done }()
+
+	client := unixClient(s.SocketPath())
+
+	// 1 MiB + 1 byte — just over the cap.
+	oversized := bytes.Repeat([]byte("x"), (1<<20)+1)
+	req, err := http.NewRequest(http.MethodPost, "http://ccmc/hooks/SessionStart", bytes.NewReader(oversized))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("POST oversized body: %v", err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body: got status %d, want 413", resp.StatusCode)
+	}
+
+	// Server must still be alive and serve a normal request.
+	resp2 := do(t, client, http.MethodGet, "/status", "")
+	slurp(t, resp2)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("post-oversize GET /status: got %d, want 200", resp2.StatusCode)
+	}
+}
+
+// ─── M1: symlink defence on socket path ──────────────────────────────────────
+
+// TestServer_SocketPath_SymlinkRefused verifies that Run returns an error when
+// the configured socket path is a symlink, and that it does not chmod, write, or
+// unlink the symlink target.
+func TestServer_SocketPath_SymlinkRefused(t *testing.T) {
+	dir, err := os.MkdirTemp("", "ccmc")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	// Create a real file the symlink will point to.
+	target := filepath.Join(dir, "innocent.file")
+	if err := os.WriteFile(target, []byte("original content"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+
+	// Place a symlink at the socket path → target.
+	sockPath := filepath.Join(dir, "d.sock")
+	if err := os.Symlink(target, sockPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	reg := newReg(t)
+	s := daemon.New(reg, buildHookHandlers(reg),
+		daemon.WithSocketPath(sockPath),
+		daemon.WithPIDPath(filepath.Join(dir, "d.pid")),
+		daemon.WithIdleTimeout(30*time.Minute),
+	)
+
+	err = s.Run(context.Background())
+	if err == nil {
+		t.Fatal("Run returned nil, want error for symlink at socket path")
+	}
+
+	// Target file must be untouched.
+	got, readErr := os.ReadFile(target)
+	if readErr != nil {
+		t.Fatalf("read target after refused start: %v", readErr)
+	}
+	if string(got) != "original content" {
+		t.Fatalf("symlink target was modified: %q", string(got))
+	}
+
+	// The symlink itself must still be there (we must not have removed it).
+	fi, lstatErr := os.Lstat(sockPath)
+	if lstatErr != nil {
+		t.Fatalf("Lstat socket path after refused start: %v", lstatErr)
+	}
+	if fi.Mode().Type()&os.ModeSymlink == 0 {
+		t.Fatal("symlink at socket path was removed or replaced — it should be untouched")
+	}
+}
+
+// ─── M1: symlink defence on PID path ─────────────────────────────────────────
+
+// TestServer_PIDPath_SymlinkRefused verifies that writePIDFile refuses to write
+// when the PID path is a symlink, and that the symlink target is untouched.
+func TestServer_PIDPath_SymlinkRefused(t *testing.T) {
+	dir, err := os.MkdirTemp("", "ccmc")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	target := filepath.Join(dir, "innocent.pid")
+	if err := os.WriteFile(target, []byte("original"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+
+	pidPath := filepath.Join(dir, "d.pid")
+	if err := os.Symlink(target, pidPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	reg := newReg(t)
+	s := daemon.New(reg, buildHookHandlers(reg),
+		daemon.WithSocketPath(filepath.Join(dir, "d.sock")),
+		daemon.WithPIDPath(pidPath),
+		daemon.WithIdleTimeout(30*time.Minute),
+	)
+
+	err = s.Run(context.Background())
+	if err == nil {
+		t.Fatal("Run returned nil, want error for symlink at PID path")
+	}
+
+	// Target must be untouched.
+	got, readErr := os.ReadFile(target)
+	if readErr != nil {
+		t.Fatalf("read target after refused start: %v", readErr)
+	}
+	if string(got) != "original" {
+		t.Fatalf("PID symlink target was modified: %q", string(got))
+	}
+}
+
+// ─── M3: in-flight counter prevents idle shutdown ────────────────────────────
+
+// TestServer_InFlight_BlocksIdleShutdown starts the server with a very short
+// idle timeout, registers a hook handler that blocks for 200ms on a channel,
+// fires a request to that handler, and asserts the daemon does NOT shut down
+// while the handler is in flight. After the handler completes, it asserts the
+// daemon shuts down on the next idle tick.
+func TestServer_InFlight_BlocksIdleShutdown(t *testing.T) {
+	dir, err := os.MkdirTemp("", "ccmc")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	reg := newReg(t)
+
+	// A channel we control: the slow handler blocks until we close it.
+	release := make(chan struct{})
+	slowHandlers := buildHookHandlers(reg)
+	// Override SessionStart with a slow variant that blocks until released.
+	slowHandlers["SessionStart"] = func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	}
+
+	// Idle timeout of 100ms, check interval 50ms — would fire almost immediately
+	// without an in-flight request.
+	s := daemon.New(reg, slowHandlers,
+		daemon.WithSocketPath(filepath.Join(dir, "d.sock")),
+		daemon.WithPIDPath(filepath.Join(dir, "d.pid")),
+		daemon.WithIdleTimeout(100*time.Millisecond),
+		daemon.WithIdleCheckInterval(50*time.Millisecond),
+	)
+
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- s.Run(context.Background()) }()
+
+	// Wait for socket to be ready.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, dialErr := net.Dial("unix", s.SocketPath())
+		if dialErr == nil {
+			conn.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	client := unixClient(s.SocketPath())
+
+	// Fire the slow request in background — it will block inside the handler.
+	requestDone := make(chan struct{})
+	go func() {
+		defer close(requestDone)
+		body := `{"type":"SessionStart","session_id":"inflight-1","project_path":"/p","timestamp":"2026-04-25T10:00:00Z"}`
+		req, _ := http.NewRequest(http.MethodPost, "http://ccmc/hooks/SessionStart", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, doErr := client.Do(req)
+		if doErr == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
+
+	// Let several idle-check ticks elapse while the handler is in flight.
+	time.Sleep(300 * time.Millisecond)
+
+	select {
+	case <-serverDone:
+		t.Fatal("daemon shut down while slow handler was in flight — in-flight counter not working")
+	default:
+		// Good: daemon is still running.
+	}
+
+	// Release the handler and wait for the request goroutine to finish.
+	close(release)
+	<-requestDone
+
+	// Now the daemon should idle-shutdown on its own since lastActivity is stale
+	// (the request was the only activity). Give it a few check intervals.
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("daemon idle-shutdown returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("daemon did not idle-shutdown after in-flight handler completed")
+	}
+}
+
+// ─── M2/stale socket: regular file at socket path is removed and bind succeeds ─
+
+// TestServer_StaleSocketFile_Removed verifies that a plain file (not a live
+// socket) at the socket path is removed and the server binds successfully.
+// This covers the EADDRINUSE → dial-fails → remove → rebind path.
+func TestServer_StaleSocketFile_Removed(t *testing.T) {
+	dir, err := os.MkdirTemp("", "ccmc")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	sockPath := filepath.Join(dir, "d.sock")
+	pidPath := filepath.Join(dir, "d.pid")
+
+	// Write a regular file at the socket path to simulate a stale socket file
+	// (the OS will return EADDRINUSE when Listen is called on a non-socket file,
+	// and the dial attempt will fail since it is not a real socket).
+	if err := os.WriteFile(sockPath, []byte("stale"), 0o600); err != nil {
+		t.Fatalf("write stale file: %v", err)
+	}
+
+	reg := newReg(t)
+	s := daemon.New(reg, buildHookHandlers(reg),
+		daemon.WithSocketPath(sockPath),
+		daemon.WithPIDPath(pidPath),
+		daemon.WithIdleTimeout(30*time.Minute),
+	)
+
+	cancel, done := startServer(t, s)
+	defer func() { cancel(); <-done }()
+
+	// Server must be reachable.
+	client := unixClient(sockPath)
+	resp := do(t, client, http.MethodGet, "/status", "")
+	slurp(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /status after stale-file cleanup: got %d, want 200", resp.StatusCode)
 	}
 }
 

@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,11 +12,22 @@ import (
 	"ccmc/pkg/ccmc"
 )
 
+// maxHookBodyBytes is the per-request body size cap for hook payloads. 1 MiB
+// is generous for any structured JSON event a hook script would produce.
+const maxHookBodyBytes = 1 << 20
+
 // readAndDecode reads the full request body and routes it through DecodeEvent.
-// Returns the parsed HookEvent or writes a 400 and returns nil.
+// Returns the parsed HookEvent or writes an error response and returns nil.
+// The body is capped at maxHookBodyBytes; exceeding it yields 413.
 func readAndDecode(w http.ResponseWriter, r *http.Request) (HookEvent, json.RawMessage) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxHookBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			http.Error(w, fmt.Sprintf("hooks: request body too large (limit %d bytes)", mbe.Limit), http.StatusRequestEntityTooLarge)
+			return nil, nil
+		}
 		http.Error(w, fmt.Sprintf("hooks: failed to read body: %v", err), http.StatusBadRequest)
 		return nil, nil
 	}
