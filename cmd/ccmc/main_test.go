@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -166,5 +168,222 @@ func TestRef_Query_LimitTen(t *testing.T) {
 	}
 	if resultRows > 10 {
 		t.Errorf("expected at most 10 results, got %d", resultRows)
+	}
+}
+
+// ── run() seam tests ──────────────────────────────────────────────────────────
+
+// runCmd is a test helper that calls run() with args and captures output.
+func runCmd(args []string) (stdout, stderr string, code int) {
+	var outBuf, errBuf bytes.Buffer
+	code = run(args, &outBuf, &errBuf)
+	return outBuf.String(), errBuf.String(), code
+}
+
+// TestRun_Version verifies "ccmc version" returns exit 0 and contains "ccmc".
+func TestRun_Version(t *testing.T) {
+	out, _, code := runCmd([]string{"version"})
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+	if !strings.Contains(out, "ccmc") {
+		t.Errorf("expected version output to contain 'ccmc', got: %q", out)
+	}
+}
+
+// TestRun_Help verifies "ccmc help" exits 0 and prints usage.
+func TestRun_Help(t *testing.T) {
+	out, _, code := runCmd([]string{"help"})
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+	if !strings.Contains(out, "Usage:") {
+		t.Errorf("expected 'Usage:' in help output, got: %q", out)
+	}
+}
+
+// TestRun_UnknownCmd verifies an unknown command exits 2 with a message.
+func TestRun_UnknownCmd(t *testing.T) {
+	_, errOut, code := runCmd([]string{"nonexistent-cmd"})
+	if code != 2 {
+		t.Fatalf("expected exit 2, got %d", code)
+	}
+	if !strings.Contains(errOut, "unknown command") {
+		t.Errorf("expected 'unknown command' in stderr, got: %q", errOut)
+	}
+}
+
+// TestRun_NoArgs verifies "ccmc" with no args exits 2 (dashboard not yet implemented).
+func TestRun_NoArgs(t *testing.T) {
+	_, _, code := runCmd(nil)
+	if code != 2 {
+		t.Fatalf("expected exit 2, got %d", code)
+	}
+}
+
+// ── daemon subcommand routing tests ──────────────────────────────────────────
+
+// TestDaemon_MissingSubcmd verifies "ccmc daemon" with no subcommand exits 2.
+func TestDaemon_MissingSubcmd(t *testing.T) {
+	_, errOut, code := runCmd([]string{"daemon"})
+	if code != 2 {
+		t.Fatalf("expected exit 2, got %d", code)
+	}
+	if !strings.Contains(errOut, "start|stop|status") {
+		t.Errorf("expected subcommand hint in stderr, got: %q", errOut)
+	}
+}
+
+// TestDaemon_UnknownSubcmd verifies "ccmc daemon bogus" exits 2 with a message.
+func TestDaemon_UnknownSubcmd(t *testing.T) {
+	_, errOut, code := runCmd([]string{"daemon", "bogus"})
+	if code != 2 {
+		t.Fatalf("expected exit 2, got %d", code)
+	}
+	if !strings.Contains(errOut, "bogus") {
+		t.Errorf("expected subcommand name in stderr, got: %q", errOut)
+	}
+}
+
+// TestDaemonStatus_NotRunning verifies "ccmc daemon status" exits 1 and
+// prints "daemon not running" when the socket is absent (no real daemon).
+func TestDaemonStatus_NotRunning(t *testing.T) {
+	// Point CCMC_DIR at an empty temp dir so there is no socket.
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+
+	_, errOut, code := runCmd([]string{"daemon", "status"})
+	if code != 1 {
+		t.Fatalf("expected exit 1, got %d; stderr: %q", code, errOut)
+	}
+	if !strings.Contains(errOut, "daemon not running") {
+		t.Errorf("expected 'daemon not running' in stderr, got: %q", errOut)
+	}
+}
+
+// TestDaemonStop_NoPIDFile verifies "ccmc daemon stop" exits 0 and prints
+// "no daemon running" when the PID file is absent.
+func TestDaemonStop_NoPIDFile(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+
+	out, _, code := runCmd([]string{"daemon", "stop"})
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stdout: %q", code, out)
+	}
+	if !strings.Contains(out, "no daemon running") {
+		t.Errorf("expected 'no daemon running' in stdout, got: %q", out)
+	}
+}
+
+// ── ccmc ls --no-daemon tests ─────────────────────────────────────────────────
+
+// TestLs_NoDaemonFlag verifies "--no-daemon" routes to filesystem scan and
+// never dials the daemon socket. We verify by pointing CCMC_DIR at a temp dir
+// with no socket — if the daemon path were taken, any socket errors would appear.
+func TestLs_NoDaemonFlag(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+	// Also point the Claude projects dir at an empty temp dir so the scan
+	// returns "no sessions" cleanly without touching the real ~/.claude/projects.
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+
+	out, errOut, code := runCmd([]string{"ls", "--no-daemon"})
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
+	}
+	// With no sessions the scanner prints "No sessions found."
+	if !strings.Contains(out, "No sessions found") {
+		t.Errorf("expected 'No sessions found' in output, got: %q", out)
+	}
+	// stderr must not contain "daemon not running" — we skipped the daemon entirely.
+	if strings.Contains(errOut, "daemon not running") {
+		t.Errorf("--no-daemon should not emit daemon warning; got stderr: %q", errOut)
+	}
+}
+
+// TestLs_FallbackWarning verifies that without --no-daemon and with no daemon
+// running, the output contains the fallback warning on stderr.
+func TestLs_FallbackWarning(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+
+	_, errOut, code := runCmd([]string{"ls"})
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
+	}
+	if !strings.Contains(errOut, "daemon not running; using filesystem-only mode") {
+		t.Errorf("expected fallback warning in stderr, got: %q", errOut)
+	}
+}
+
+// ── ccmc setup tests ──────────────────────────────────────────────────────────
+
+// TestSetup_CreatesConfigAndDir verifies that setup creates ~/.ccmc/ and
+// config.yaml on a clean temp dir, and that a second run is idempotent
+// (config.yaml content is unchanged).
+func TestSetup_Idempotent(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+
+	// First run: should succeed and create config.yaml.
+	out1, errOut1, code1 := runCmd([]string{"setup"})
+	if code1 != 0 {
+		t.Fatalf("first setup: expected exit 0, got %d; stderr: %q", code1, errOut1)
+	}
+
+	configPath := filepath.Join(tmp, "config.yaml")
+	data1, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("config.yaml not created after first setup: %v", err)
+	}
+	_ = out1
+
+	// Sentinel: second run must not overwrite config.yaml.
+	sentinel := "# sentinel"
+	if err := os.WriteFile(configPath, []byte(sentinel), 0o600); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+
+	out2, errOut2, code2 := runCmd([]string{"setup"})
+	if code2 != 0 {
+		t.Fatalf("second setup: expected exit 0, got %d; stderr: %q", code2, errOut2)
+	}
+
+	data2, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config.yaml after second setup: %v", err)
+	}
+	if string(data2) != sentinel {
+		t.Errorf("second run overwrote config.yaml; want sentinel %q, got %q", sentinel, string(data2))
+	}
+
+	// Also verify first run actually wrote non-empty content.
+	if len(data1) == 0 {
+		t.Error("config.yaml was empty after first setup")
+	}
+
+	_ = out2
+}
+
+// TestSetup_AlreadySetUpMessage verifies the "already set up" path emits the
+// right message when config.yaml pre-exists and hooks are already installed.
+func TestSetup_AlreadySetUpMessage(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+
+	// Run once to lay everything down, then run again.
+	if _, _, code := runCmd([]string{"setup"}); code != 0 {
+		t.Fatal("first setup failed")
+	}
+	out, _, code := runCmd([]string{"setup"})
+	if code != 0 {
+		t.Fatalf("second setup: expected exit 0, got %d", code)
+	}
+	if !strings.Contains(out, "already set up") {
+		t.Errorf("expected 'already set up' message on second run, got: %q", out)
 	}
 }

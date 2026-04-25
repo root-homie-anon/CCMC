@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -25,6 +24,7 @@ Usage: ccmc [command]
 Commands:
   (no args)              Launch the dashboard (TUI)
   ls                     List all tracked sessions (table format)
+  ls --no-daemon         List sessions using filesystem scan only
   inspect <session-id>   Detailed session inspection
   kill <session-id>      Kill a CC session
   launch <directory>     Launch new CC session (iTerm tab or subprocess)
@@ -68,88 +68,7 @@ Flags:
 `
 
 func main() {
-	args := os.Args[1:]
-
-	if len(args) == 0 {
-		// No args: launch dashboard (TUI) — wired in Phase 4
-		fmt.Fprintln(os.Stderr, "ccmc: dashboard not yet implemented")
-		os.Exit(2)
-	}
-
-	cmd := args[0]
-
-	switch cmd {
-	case "version", "--version", "-v":
-		fmt.Println("ccmc", version)
-
-	case "help", "--help", "-h":
-		fmt.Print(helpText)
-
-	case "ls":
-		runLs()
-	case "inspect":
-		if len(args) < 2 {
-			fmt.Fprintln(os.Stderr, "ccmc inspect: missing session-id\nUsage: ccmc inspect <session-id>")
-			os.Exit(2)
-		}
-		runInspect(args[1])
-	case "kill":
-		notImplemented("kill")
-	case "launch":
-		notImplemented("launch")
-	case "ref":
-		code := runRef(args[1:], os.Stdout, os.Stderr)
-		if code != 0 {
-			os.Exit(code)
-		}
-	case "inventory":
-		notImplemented("inventory")
-	case "eval":
-		notImplemented("eval")
-	case "install":
-		notImplemented("install")
-	case "tools":
-		notImplemented("tools")
-	case "setup":
-		notImplemented("setup")
-	case "iterm-install":
-		notImplemented("iterm-install")
-	case "daemon":
-		notImplemented("daemon")
-
-	default:
-		fmt.Fprintf(os.Stderr, "ccmc: unknown command %q\nRun 'ccmc help' for usage.\n", cmd)
-		os.Exit(2)
-	}
-}
-
-func runLs() {
-	sessions, err := daemon.ScanSessions()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ccmc ls: %v\n", err)
-		os.Exit(1)
-	}
-
-	if len(sessions) == 0 {
-		fmt.Println("No sessions found.")
-		return
-	}
-
-	// Sort by last activity, most recent first
-	sort.Slice(sessions, func(i, j int) bool {
-		return sessions[i].LastActivity.After(sessions[j].LastActivity)
-	})
-
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "PROJECT\tSESSION\tLAST ACTIVITY\tSIZE")
-	fmt.Fprintln(w, "-------\t-------\t-------------\t----")
-
-	for _, s := range sessions {
-		age := formatAge(s.LastActivity)
-		size := formatSize(s.ContextEstimate)
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", s.ProjectName, truncate(s.ID, 12), age, size)
-	}
-	w.Flush()
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
 func runInspect(sessionID string) {
@@ -486,9 +405,4 @@ func printRefDetail(out io.Writer, e ccmc.RefEntry) {
 		}
 	}
 	fmt.Fprintln(out, sep)
-}
-
-func notImplemented(cmd string) {
-	fmt.Fprintf(os.Stderr, "ccmc %s: not yet implemented\n", cmd)
-	os.Exit(2)
 }
