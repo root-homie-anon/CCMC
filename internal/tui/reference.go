@@ -19,9 +19,16 @@ import (
 // letting App.Update transition focus back to sessions.
 type closeOverlayMsg struct{}
 
+// searcher is a test seam so unit tests can stub the search engine without
+// pulling in real YAML data or the fuzzy library. *reference.Engine satisfies
+// this interface implicitly.
+type searcher interface {
+	Search(query string, category *ccmc.RefCategory, limit int) []ccmc.RefEntry
+}
+
 // referenceModel implements ReferencePanel.
 type referenceModel struct {
-	engine     *reference.Engine
+	engine     searcher
 	input      textinput.Model
 	results    []ccmc.RefEntry
 	selected   int

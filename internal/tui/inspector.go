@@ -27,6 +27,44 @@ type inspectorLoadedMsg struct {
 	err     error
 }
 
+// inspectorLoadFunc is a test seam: tests swap this to return canned results
+// without touching the filesystem or daemon socket.
+var inspectorLoadFunc = defaultInspectorLoad
+
+// defaultInspectorLoad is the real implementation used in production.
+func defaultInspectorLoad(s ccmc.Session) inspectorLoadedMsg {
+	jsonlPath, _, err := daemon.FindSessionJSONL(s.ID)
+	if err != nil {
+		return inspectorLoadedMsg{session: s, err: fmt.Errorf("find JSONL: %w", err)}
+	}
+	if jsonlPath == "" {
+		return inspectorLoadedMsg{session: s, err: fmt.Errorf("JSONL not found for session %s", s.ID)}
+	}
+
+	f, err := os.Open(jsonlPath)
+	if err != nil {
+		return inspectorLoadedMsg{session: s, err: fmt.Errorf("open JSONL: %w", err)}
+	}
+	defer f.Close()
+
+	sv, err := inspector.AggregateSession(f)
+	if err != nil {
+		return inspectorLoadedMsg{session: s, err: fmt.Errorf("aggregate: %w", err)}
+	}
+
+	mem, err := inspector.ReadMemorySummaryForSession(s.ID)
+	if err != nil {
+		mem = "" // non-fatal; render "(none)"
+	}
+
+	todos, err := inspector.ReadTodos(s.ID)
+	if err != nil {
+		todos = nil // non-fatal
+	}
+
+	return inspectorLoadedMsg{session: s, view: sv, memory: mem, todos: todos}
+}
+
 // inspectorModel implements InspectorPanel.
 type inspectorModel struct {
 	focused  bool
@@ -119,36 +157,7 @@ func (m *inspectorModel) Update(msg tea.Msg) (InspectorPanel, tea.Cmd) {
 // loadSession returns a Cmd that runs the aggregator off the UI goroutine.
 func (m *inspectorModel) loadSession(s ccmc.Session) tea.Cmd {
 	return func() tea.Msg {
-		jsonlPath, _, err := daemon.FindSessionJSONL(s.ID)
-		if err != nil {
-			return inspectorLoadedMsg{session: s, err: fmt.Errorf("find JSONL: %w", err)}
-		}
-		if jsonlPath == "" {
-			return inspectorLoadedMsg{session: s, err: fmt.Errorf("JSONL not found for session %s", s.ID)}
-		}
-
-		f, err := os.Open(jsonlPath)
-		if err != nil {
-			return inspectorLoadedMsg{session: s, err: fmt.Errorf("open JSONL: %w", err)}
-		}
-		defer f.Close()
-
-		sv, err := inspector.AggregateSession(f)
-		if err != nil {
-			return inspectorLoadedMsg{session: s, err: fmt.Errorf("aggregate: %w", err)}
-		}
-
-		mem, err := inspector.ReadMemorySummaryForSession(s.ID)
-		if err != nil {
-			mem = "" // non-fatal; render "(none)"
-		}
-
-		todos, err := inspector.ReadTodos(s.ID)
-		if err != nil {
-			todos = nil // non-fatal
-		}
-
-		return inspectorLoadedMsg{session: s, view: sv, memory: mem, todos: todos}
+		return inspectorLoadFunc(s)
 	}
 }
 
