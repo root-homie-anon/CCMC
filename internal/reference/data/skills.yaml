@@ -1,0 +1,70 @@
+- name: simplify
+  category: skills
+  description: Reviews changed code for reuse, quality, and efficiency, then fixes any issues found.
+  usage: /simplify
+  examples:
+    - "/simplify"
+  related:
+    - /compact
+    - /diff
+  gotchas:
+    - "Analyzes the current context window's changes — run after a feature is complete, not mid-implementation."
+    - "May rewrite code outside the files you expect if it finds reuse opportunities in related modules."
+
+- name: batch
+  category: skills
+  description: Batches multiple related operations into a single efficient pass, reducing redundant tool calls.
+  usage: /batch
+  examples:
+    - "/batch"
+  related:
+    - /loop
+  gotchas:
+    - "Intended for repeated similar operations — gains little when tasks are structurally different."
+
+- name: debug
+  category: skills
+  description: Structured debugging workflow — reproduces the failure, isolates the root cause, and proposes a targeted fix.
+  usage: /debug
+  examples:
+    - "/debug"
+  related:
+    - /simplify
+  gotchas:
+    - "Requires enough context about the failure; provide error output or reproduction steps in the prompt."
+
+- name: loop
+  category: skills
+  description: Runs a prompt or slash command on a recurring interval, enabling polling or repeating tasks.
+  usage: /loop [interval] [command]
+  examples:
+    - "/loop 5m /debug"
+    - "/loop"
+  related:
+    - /batch
+  gotchas:
+    - "Without an interval, the model self-paces — it decides when to fire the next iteration."
+    - "Use for recurring checks (build polling, status watching), not one-off tasks."
+
+- name: claude-api
+  category: skills
+  description: Builds, debugs, and optimizes Claude API and Anthropic SDK applications, with prompt caching applied automatically.
+  usage: /claude-api
+  examples:
+    - "/claude-api"
+  related:
+    - /simplify
+  gotchas:
+    - "Triggers automatically when code imports the anthropic or @anthropic-ai/sdk packages."
+    - "Handles migration between Claude model versions (e.g. 4.5 → 4.6 → 4.7) and retired-model replacements."
+
+- name: btw
+  category: skills
+  description: Surface a non-blocking observation or suggestion alongside ongoing work without interrupting the main task flow.
+  usage: /btw
+  examples:
+    - "/btw"
+  related:
+    - /status
+  gotchas:
+    - "Output is advisory — it does not block or redirect the current task."
