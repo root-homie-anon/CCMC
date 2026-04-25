@@ -29,6 +29,7 @@ import (
 	"ccmc/internal/config"
 	"ccmc/internal/daemon"
 	"ccmc/internal/hooks"
+	"ccmc/internal/lifecycle"
 	"ccmc/pkg/ccmc"
 )
 
@@ -78,11 +79,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runSetup(stdout, stderr)
 
 	case "kill":
-		fmt.Fprintln(stderr, "ccmc kill: not yet implemented")
-		return 2
+		return runKill(rest, stdout, stderr)
 	case "launch":
-		fmt.Fprintln(stderr, "ccmc launch: not yet implemented")
-		return 2
+		return runLaunch(rest, stdout, stderr)
 	case "inventory":
 		fmt.Fprintln(stderr, "ccmc inventory: not yet implemented")
 		return 2
@@ -593,4 +592,50 @@ func waitForSocket(socketPath string, timeout time.Duration) bool {
 		time.Sleep(50 * time.Millisecond)
 	}
 	return false
+}
+
+// ── kill / launch (task 37–39) ────────────────────────────────────────────────
+
+// runKill implements "ccmc kill <session-id>". It resolves the session PID from
+// the daemon registry (or OS process table fallback), sends SIGTERM, and polls
+// for exit up to 5 seconds. Exits 1 on failure.
+func runKill(args []string, stdout, stderr io.Writer) int {
+	if len(args) < 1 {
+		fmt.Fprintln(stderr, "ccmc kill: missing session-id\nUsage: ccmc kill <session-id>")
+		return 2
+	}
+	id := args[0]
+
+	client := ccmc.NewClient(ccmc.WithAutoStart(true))
+	if err := lifecycle.Kill(client, id); err != nil {
+		fmt.Fprintf(stderr, "ccmc kill: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "killed session %s\n", id)
+	return 0
+}
+
+// runLaunch implements "ccmc launch <dir>". It validates the directory, opens a
+// new iTerm tab running "claude" (with subprocess fallback), and polls the daemon
+// for the new session ID. Exits 1 on failure.
+func runLaunch(args []string, stdout, stderr io.Writer) int {
+	if len(args) < 1 {
+		fmt.Fprintln(stderr, "ccmc launch: missing directory\nUsage: ccmc launch <dir>")
+		return 2
+	}
+	dir := args[0]
+
+	if err := lifecycle.ValidateDir(dir); err != nil {
+		fmt.Fprintf(stderr, "ccmc launch: %v\n", err)
+		return 1
+	}
+
+	client := ccmc.NewClient(ccmc.WithAutoStart(true))
+	id, err := lifecycle.Launch(client, dir)
+	if err != nil {
+		fmt.Fprintf(stderr, "ccmc launch: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "launched session %s in %s\n", id, dir)
+	return 0
 }

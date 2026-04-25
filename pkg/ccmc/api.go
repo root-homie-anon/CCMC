@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"syscall"
 	"time"
 
@@ -327,6 +326,8 @@ func StartDaemonWithBinary(binaryPath, socketPath string) error {
 		if stat.Uid != uint32(os.Getuid()) {
 			return fmt.Errorf("auto-start: binary path %q is not owned by current user", binaryPath)
 		}
+	} else {
+		return fmt.Errorf("auto-start: stat sys: unexpected type %T", fi.Sys())
 	}
 
 	logPath, err := daemonLogPath()
@@ -419,14 +420,6 @@ func AllowedDaemonEnvKeys() []string {
 	out := make([]string, len(allowedDaemonEnvKeys))
 	copy(out, allowedDaemonEnvKeys)
 	return out
-}
-
-// splitEnvKey returns the key portion of a "KEY=VALUE" string.
-func splitEnvKey(kv string) string {
-	if i := strings.IndexByte(kv, '='); i >= 0 {
-		return kv[:i]
-	}
-	return kv
 }
 
 // waitForSocket polls os.Stat on socketPath every 50 ms until the file appears

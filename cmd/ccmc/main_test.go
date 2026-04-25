@@ -763,3 +763,80 @@ func buildDaemonHelperCmd(exe, dir string) *exec.Cmd {
 	cmd.Stdin = devnull
 	return cmd
 }
+
+// ── ccmc kill / ccmc launch routing tests ────────────────────────────────────
+
+// TestKillCmd_MissingID verifies "ccmc kill" with no session-id exits 2 with a
+// usage message.
+func TestKillCmd_MissingID(t *testing.T) {
+	_, errOut, code := runCmd([]string{"kill"})
+	if code != 2 {
+		t.Fatalf("expected exit 2, got %d; stderr: %q", code, errOut)
+	}
+	if !strings.Contains(errOut, "session-id") {
+		t.Errorf("expected session-id hint in stderr, got: %q", errOut)
+	}
+}
+
+// TestKillCmd_SessionNotFound verifies "ccmc kill <id>" with no daemon running
+// exits 1 with an error (daemon unavailable → can't look up session).
+func TestKillCmd_SessionNotFound(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+
+	_, errOut, code := runCmd([]string{"kill", "nonexistent-id"})
+	if code != 1 {
+		t.Fatalf("expected exit 1, got %d; stderr: %q", code, errOut)
+	}
+	// Error should mention the kill failure — either daemon unavailable or not found.
+	if errOut == "" {
+		t.Errorf("expected non-empty stderr on kill failure")
+	}
+}
+
+// TestLaunchCmd_MissingDir verifies "ccmc launch" with no directory exits 2 with
+// a usage message.
+func TestLaunchCmd_MissingDir(t *testing.T) {
+	_, errOut, code := runCmd([]string{"launch"})
+	if code != 2 {
+		t.Fatalf("expected exit 2, got %d; stderr: %q", code, errOut)
+	}
+	if !strings.Contains(errOut, "directory") {
+		t.Errorf("expected directory hint in stderr, got: %q", errOut)
+	}
+}
+
+// TestLaunchCmd_InvalidDir verifies "ccmc launch <nonexistent-path>" exits 1
+// with a clear error before attempting to contact the daemon.
+func TestLaunchCmd_InvalidDir(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+
+	_, errOut, code := runCmd([]string{"launch", filepath.Join(tmp, "does-not-exist")})
+	if code != 1 {
+		t.Fatalf("expected exit 1 for missing dir, got %d; stderr: %q", code, errOut)
+	}
+	if errOut == "" {
+		t.Errorf("expected non-empty stderr for invalid dir")
+	}
+}
+
+// TestLaunchCmd_FileNotDir verifies "ccmc launch <file>" exits 1 because the
+// argument names a file, not a directory.
+func TestLaunchCmd_FileNotDir(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+
+	f := filepath.Join(tmp, "notadir.txt")
+	if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	_, errOut, code := runCmd([]string{"launch", f})
+	if code != 1 {
+		t.Fatalf("expected exit 1 for file arg, got %d; stderr: %q", code, errOut)
+	}
+	if errOut == "" {
+		t.Errorf("expected non-empty stderr for file arg")
+	}
+}
