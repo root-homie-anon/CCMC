@@ -1,0 +1,191 @@
+- name: --model
+  category: flags
+  description: Sets the Claude model to use for the session.
+  usage: --model <model-name>
+  examples:
+    - "claude --model claude-opus-4-5"
+    - "claude --model claude-sonnet-4-6"
+  related:
+    - /model
+    - --effort
+  gotchas:
+    - "Model name must match an available model exactly — invalid values produce an error at startup."
+    - "Can be changed mid-session with /model without restarting."
+
+- name: --system-prompt
+  category: flags
+  description: Provides an inline system prompt string to prepend to the session context.
+  usage: --system-prompt "<text>"
+  examples:
+    - "claude --system-prompt \"You are a Go expert.\""
+  related:
+    - --system-prompt-file
+    - --append-system-prompt
+  gotchas:
+    - "The inline prompt is prepended before CLAUDE.md instructions — order may affect model behavior."
+    - "Shell quoting is required; multi-line prompts are easier to manage via --system-prompt-file."
+
+- name: --system-prompt-file
+  category: flags
+  description: Reads the system prompt from a file instead of an inline string.
+  usage: --system-prompt-file <path>
+  examples:
+    - "claude --system-prompt-file ~/.claude/prompts/go-expert.md"
+  related:
+    - --system-prompt
+    - --append-system-prompt-file
+  gotchas:
+    - "File path must be readable at session start; a missing file aborts launch."
+
+- name: --append-system-prompt
+  category: flags
+  description: Appends an inline string to the system prompt after CLAUDE.md instructions.
+  usage: --append-system-prompt "<text>"
+  examples:
+    - "claude --append-system-prompt \"Always respond in Spanish.\""
+  related:
+    - --system-prompt
+    - --append-system-prompt-file
+  gotchas:
+    - "Appended after CLAUDE.md, not before — use --system-prompt if ordering matters."
+
+- name: --append-system-prompt-file
+  category: flags
+  description: Appends system prompt content from a file, after CLAUDE.md instructions.
+  usage: --append-system-prompt-file <path>
+  examples:
+    - "claude --append-system-prompt-file ~/.claude/prompts/style-guide.md"
+  related:
+    - --append-system-prompt
+    - --system-prompt-file
+  gotchas:
+    - "File is read once at startup — changes to the file mid-session have no effect."
+
+- name: --output-format
+  category: flags
+  description: Controls the output format of the CLI response (e.g. text, json, stream-json).
+  usage: --output-format <format>
+  examples:
+    - "claude --output-format json -p \"summarize this\""
+    - "claude --output-format stream-json -p \"list files\""
+  related:
+    - -p
+    - --verbose
+  gotchas:
+    - "json and stream-json are primarily useful in non-interactive / scripted (-p) mode."
+    - "stream-json emits incremental JSON objects per token, not a single final object."
+
+- name: --resume
+  category: flags
+  description: Resumes a previous session by session ID, restoring its context.
+  usage: --resume <session-id>
+  examples:
+    - "claude --resume abc123def456"
+  related:
+    - --continue
+    - --no-session-persistence
+  gotchas:
+    - "Session must exist in ~/.claude/projects/ — expired or deleted sessions cannot be resumed."
+    - "Different from --continue, which resumes the most recent session in the current directory."
+
+- name: --continue
+  category: flags
+  description: Continues the most recent session in the current working directory without specifying a session ID.
+  usage: --continue
+  examples:
+    - "claude --continue"
+  related:
+    - --resume
+    - --no-session-persistence
+  gotchas:
+    - "Selects the last session by modification time for the current project directory."
+    - "If no prior session exists in the directory, starts a fresh session."
+
+- name: --no-session-persistence
+  category: flags
+  description: Runs the session without writing a JSONL transcript to ~/.claude/projects/, useful for ephemeral or sensitive sessions.
+  usage: --no-session-persistence
+  examples:
+    - "claude --no-session-persistence"
+  related:
+    - --resume
+    - --continue
+  gotchas:
+    - "Sessions started with this flag cannot be resumed, inspected, or tracked by ccmc."
+    - "Hook events still fire — the daemon can see the session, but no JSONL is written to disk."
+
+- name: --verbose
+  category: flags
+  description: Enables verbose output, showing additional internal information such as tool call details and timing.
+  usage: --verbose
+  examples:
+    - "claude --verbose"
+  related:
+    - --output-format
+  gotchas:
+    - "Output volume increases significantly in verbose mode — not recommended for normal interactive use."
+
+- name: --agent
+  category: flags
+  description: Launches the session as a named subagent, loading the specified agent definition from .claude/agents/ or ~/.claude/agents/.
+  usage: --agent <agent-name>
+  examples:
+    - "claude --agent ref-builder"
+  related:
+    - --add-dir
+  gotchas:
+    - "Agent name must match an existing agent markdown file (without the .md extension)."
+    - "Agent-level model and tool restrictions from the frontmatter are applied at startup."
+
+- name: --add-dir
+  category: flags
+  description: Adds an additional directory to the session's allowed file access scope, beyond the current working directory.
+  usage: --add-dir <path>
+  examples:
+    - "claude --add-dir /Users/me/shared-utils"
+    - "claude --add-dir /tmp/scratch"
+  related:
+    - --agent
+  gotchas:
+    - "Directory must exist at session start — a missing path produces an error."
+    - "Multiple --add-dir flags are supported to add several directories."
+
+- name: --worktree
+  category: flags
+  description: Creates a git worktree for the session, isolating file changes from the main working tree.
+  usage: --worktree [branch-name]
+  examples:
+    - "claude --worktree feature/my-experiment"
+    - "claude --worktree"
+  related:
+    - --agent
+  gotchas:
+    - "Requires the project to be a git repository; non-git directories will error."
+    - "Without a branch name, CC generates a temporary branch name automatically."
+
+- name: --effort
+  category: flags
+  description: Sets the reasoning effort level for extended thinking models (low, medium, high).
+  usage: --effort <level>
+  examples:
+    - "claude --model claude-opus-4-5 --effort high"
+    - "claude --effort medium"
+  related:
+    - --model
+  gotchas:
+    - "Only applies to models that support extended thinking — ignored by other models."
+    - "Higher effort increases token usage and latency significantly."
+
+- name: -p
+  category: flags
+  description: Print mode — runs a single non-interactive prompt and exits, writing the response to stdout.
+  usage: -p "<prompt>"
+  examples:
+    - "claude -p \"what does this function do?\""
+    - "claude -p \"list all TODO comments\" --output-format json"
+  related:
+    - --output-format
+    - --no-session-persistence
+  gotchas:
+    - "No interactive session is started — stdin is not read after the initial prompt."
+    - "Exit code reflects whether the model completed successfully (0) or errored (non-zero)."
