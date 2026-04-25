@@ -1,0 +1,297 @@
+- name: ~/.claude/
+  category: filepaths
+  description: Root of the global Claude Code configuration directory, containing all user-level config, skills, agents, commands, and session data.
+  usage: ""
+  examples:
+    - "~/.claude/"
+  related:
+    - ~/.claude/settings.json
+    - ~/.claude/CLAUDE.md
+  gotchas:
+    - "Override with CLAUDE_CONFIG_DIR to redirect all config reads and writes to a different path."
+
+- name: ~/.claude/settings.json
+  category: filepaths
+  description: Global settings file for Claude Code — defines hooks, permission rules, MCP server configs, and env vars applied to all sessions.
+  usage: ""
+  examples:
+    - "~/.claude/settings.json"
+  related:
+    - .claude/settings.json
+    - ~/.claude/CLAUDE.md
+  gotchas:
+    - "Project-level .claude/settings.json overrides fields in this file per-session."
+    - "Always write a .bak before modifying — cc and ccmc both write to this file."
+    - "Invalid JSON causes CC to fail to start."
+
+- name: ~/.claude/CLAUDE.md
+  category: filepaths
+  description: Global memory and instructions file loaded into every CC session's context, regardless of project.
+  usage: ""
+  examples:
+    - "~/.claude/CLAUDE.md"
+  related:
+    - ~/.claude/settings.json
+    - CLAUDE.md (project root)
+  gotchas:
+    - "Loaded before project-level CLAUDE.md — conflicts between global and project instructions favor the project level."
+    - "Fires the InstructionsLoaded hook with scope: global when loaded."
+
+- name: ~/.claude/commands/
+  category: filepaths
+  description: Directory of global custom slash command files (.md), available as /command-name in all sessions.
+  usage: ""
+  examples:
+    - "~/.claude/commands/my-command.md"
+  related:
+    - .claude/commands/
+    - ~/.claude/skills/
+  gotchas:
+    - "Command name is the filename without .md extension."
+    - "Global commands are available in all projects; project commands only in that project."
+
+- name: ~/.claude/skills/
+  category: filepaths
+  description: Directory of global skill files (SKILL.md or <name>.md), bundled into all sessions and invocable by the model or user.
+  usage: ""
+  examples:
+    - "~/.claude/skills/simplify.md"
+  related:
+    - .claude/skills/
+    - ~/.claude/commands/
+  gotchas:
+    - "Each skill directory or file contains frontmatter with name, description, and invocation mode."
+    - "Skills here are available globally; project-scoped skills live in .claude/skills/."
+
+- name: ~/.claude/agents/
+  category: filepaths
+  description: Directory of global agent definition files (.md), available for spawning via the Agent and Task tools in all sessions.
+  usage: ""
+  examples:
+    - "~/.claude/agents/ref-builder.md"
+  related:
+    - .claude/agents/
+    - ~/.claude/skills/
+  gotchas:
+    - "Agent frontmatter must include agent: true to be recognized as an agent definition."
+    - "Global agents are overridden by identically-named project-scoped agents."
+
+- name: ~/.claude/plugins/
+  category: filepaths
+  description: Directory of installed CC plugins, each a subdirectory containing a plugin manifest and its component skills, agents, hooks, and MCP configs.
+  usage: ""
+  examples:
+    - "~/.claude/plugins/my-plugin/"
+  related:
+    - ~/.claude/skills/
+    - ~/.claude/agents/
+  gotchas:
+    - "Plugin directory structure is defined by the plugin manifest — do not modify manually."
+
+- name: ~/.claude/projects/
+  category: filepaths
+  description: Directory containing per-project session data, keyed by an encoded form of the project's absolute path.
+  usage: ""
+  examples:
+    - "~/.claude/projects/<encoded-cwd>/"
+  related:
+    - ~/.claude/projects/<encoded-cwd>/*.jsonl
+    - ~/.claude/todos/
+  gotchas:
+    - "Directory names are base64 or percent-encoded forms of the absolute project path — decode to get the project path."
+    - "Each project directory may contain multiple session JSONL files, one per session."
+
+- name: ~/.claude/projects/<encoded-cwd>/*.jsonl
+  category: filepaths
+  description: JSONL session transcript files, one per CC session, containing every message and tool call in the session.
+  usage: ""
+  examples:
+    - "~/.claude/projects/%2FUsers%2Fme%2Fproject/abc123.jsonl"
+  related:
+    - ~/.claude/projects/
+    - ~/.claude/projects/<hash>/<session>/session-memory/summary.md
+  gotchas:
+    - "Stream-parse line by line — never load the full file into memory; transcripts can be very large."
+    - "Read-only — never write to JSONL files."
+    - "Session ID is the filename without the .jsonl extension."
+
+- name: ~/.claude/projects/<hash>/<session>/session-memory/summary.md
+  category: filepaths
+  description: Session memory summary file written by CC at context compaction, containing a markdown summary of completed work.
+  usage: ""
+  examples:
+    - "~/.claude/projects/abc123/def456/session-memory/summary.md"
+  related:
+    - ~/.claude/projects/<encoded-cwd>/*.jsonl
+    - /compact
+  gotchas:
+    - "Not present for sessions that have never been compacted — handle missing file gracefully."
+    - "Content is a CC-generated markdown summary, not a verbatim transcript."
+
+- name: ~/.claude/todos/<sessionId>.json
+  category: filepaths
+  description: JSON file containing the todo list state for a specific session, updated by CC as todos are created, completed, or cancelled.
+  usage: ""
+  examples:
+    - "~/.claude/todos/abc123def456.json"
+  related:
+    - ~/.claude/projects/<encoded-cwd>/*.jsonl
+  gotchas:
+    - "File is absent if the session never used the todo system — treat missing as empty list."
+    - "Updated live during the session — read the latest version each time for current state."
+
+- name: ~/.claude/shell-snapshots/
+  category: filepaths
+  description: Directory of shell environment snapshots taken at session boundaries, used to restore shell state on resume.
+  usage: ""
+  examples:
+    - "~/.claude/shell-snapshots/"
+  related:
+    - ~/.claude/projects/
+  gotchas:
+    - "Managed by CC — do not manually edit snapshot files."
+
+- name: ~/.claude/backups/
+  category: filepaths
+  description: Directory where CC stores automatic backups of modified config files (settings.json, CLAUDE.md) before overwriting.
+  usage: ""
+  examples:
+    - "~/.claude/backups/settings.json.2026-04-25T12-00-00.bak"
+  related:
+    - ~/.claude/settings.json
+  gotchas:
+    - "Backups accumulate over time — clean up old backups manually if disk space is a concern."
+
+- name: .claude/
+  category: filepaths
+  description: Project-level Claude Code configuration directory, scoped to the current project root.
+  usage: ""
+  examples:
+    - ".claude/"
+  related:
+    - ~/.claude/
+    - .claude/settings.json
+  gotchas:
+    - "Settings and agents here take precedence over global ~/.claude/ equivalents for this project."
+
+- name: .claude/settings.json
+  category: filepaths
+  description: Project-level settings file for Claude Code — defines project-specific hooks, permission rules, and MCP servers.
+  usage: ""
+  examples:
+    - ".claude/settings.json"
+  related:
+    - ~/.claude/settings.json
+    - .claude/agents/
+  gotchas:
+    - "Merged with global settings.json at session start — project values override global values on conflict."
+    - "Commit this file to version control to share hook and permission config with teammates."
+
+- name: .claude/agents/
+  category: filepaths
+  description: Project-level agent definition directory — agents here are available only within this project's CC sessions.
+  usage: ""
+  examples:
+    - ".claude/agents/ref-builder.md"
+  related:
+    - ~/.claude/agents/
+    - .claude/skills/
+  gotchas:
+    - "Project agents override global agents with the same name."
+
+- name: .claude/commands/
+  category: filepaths
+  description: Project-level custom slash command directory — commands here are available only in this project's sessions.
+  usage: ""
+  examples:
+    - ".claude/commands/deploy.md"
+  related:
+    - ~/.claude/commands/
+  gotchas:
+    - "Project commands override global commands with the same name."
+
+- name: .claude/skills/
+  category: filepaths
+  description: Project-level skill directory — skills here are available only in this project's sessions.
+  usage: ""
+  examples:
+    - ".claude/skills/project-specific.md"
+  related:
+    - ~/.claude/skills/
+  gotchas:
+    - "Project skills override global skills with the same name."
+
+- name: CLAUDE.md (project root)
+  category: filepaths
+  description: Project-level memory and instructions file placed at the project root, loaded into every session started in this project.
+  usage: ""
+  examples:
+    - "CLAUDE.md"
+    - "/Users/me/projects/myproject/CLAUDE.md"
+  related:
+    - ~/.claude/CLAUDE.md
+    - .claude/settings.json
+  gotchas:
+    - "Loaded after global ~/.claude/CLAUDE.md — project instructions can extend or override global ones."
+    - "Fires the InstructionsLoaded hook with scope: project when loaded."
+    - "Do not duplicate sections already in ~/.claude/CLAUDE.md — they are already in context."
+
+- name: ~/.ccmc/config.yaml
+  category: filepaths
+  description: CCMC's own configuration file, controlling daemon behavior, hook installation state, and the tool integrator's Anthropic API key.
+  usage: ""
+  examples:
+    - "~/.ccmc/config.yaml"
+  related:
+    - ~/.ccmc/registry.json
+    - ~/.ccmc/daemon.pid
+  gotchas:
+    - "Created with defaults on first run of ccmc setup — edit to customize daemon and integrator behavior."
+
+- name: ~/.ccmc/registry.json
+  category: filepaths
+  description: CCMC daemon's persistent session registry snapshot, written every 30 seconds and loaded on daemon restart.
+  usage: ""
+  examples:
+    - "~/.ccmc/registry.json"
+  related:
+    - ~/.ccmc/config.yaml
+    - ~/.ccmc/daemon.pid
+  gotchas:
+    - "Stale registry entries (sessions that no longer exist) are cleaned up on the next filesystem scan."
+    - "Do not edit manually — the daemon overwrites it on its next snapshot cycle."
+
+- name: ~/.ccmc/daemon.pid
+  category: filepaths
+  description: PID file written by the CCMC daemon on startup, used by ccmc daemon stop to send SIGTERM to the correct process.
+  usage: ""
+  examples:
+    - "~/.ccmc/daemon.pid"
+  related:
+    - ~/.ccmc/ccmc.sock
+    - ~/.ccmc/config.yaml
+  gotchas:
+    - "Stale PID files from crashed daemon processes can be left behind — delete if ccmc daemon status shows no running process."
+
+- name: ~/.ccmc/ccmc.sock
+  category: filepaths
+  description: Unix socket file on which the CCMC daemon listens for hook events and API requests from the CLI and TUI.
+  usage: ""
+  examples:
+    - "~/.ccmc/ccmc.sock"
+  related:
+    - ~/.ccmc/daemon.pid
+  gotchas:
+    - "Absence of this file means the daemon is not running — ccmc will attempt auto-start when needed."
+    - "Stale socket files from crashed daemons are cleaned up on next daemon start."
+
+- name: ~/.ccmc/tools/
+  category: filepaths
+  description: Directory where ccmc install clones external tool and MCP server repositories for local management.
+  usage: ""
+  examples:
+    - "~/.ccmc/tools/mcp-postgres/"
+  related:
+    - ~/.ccmc/config.yaml
+  gotchas:
+    - "Each subdirectory is a cloned git repo — use ccmc tools update to pull new versions."
