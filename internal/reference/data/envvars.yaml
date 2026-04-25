@@ -1,0 +1,142 @@
+- name: ANTHROPIC_API_KEY
+  category: envvars
+  description: API key for authenticating with the Anthropic API; required for ccmc eval and any direct Anthropic API usage.
+  usage: "ANTHROPIC_API_KEY=<key>"
+  examples:
+    - "export ANTHROPIC_API_KEY=sk-ant-..."
+  related:
+    - CLAUDE_CONFIG_DIR
+  gotchas:
+    - "Required only for features that call the Anthropic API (ccmc eval). Session observation and reference work without it."
+    - "Can also be set in ~/.ccmc/config.yaml under integrator.anthropic_api_key."
+
+- name: CLAUDE_ENV_FILE
+  category: envvars
+  description: Path to an environment file that CC loads at session start, injecting its key=value pairs into the session environment.
+  usage: "CLAUDE_ENV_FILE=<path>"
+  examples:
+    - "export CLAUDE_ENV_FILE=/Users/me/projects/myproject/.env.claude"
+  related:
+    - CLAUDE_CONFIG_DIR
+    - CLAUDE_PROJECT_DIR
+  gotchas:
+    - "Loaded at session start only — changes to the file mid-session are not picked up."
+    - "Variables set here override the shell environment for the session."
+
+- name: CLAUDE_PROJECT_DIR
+  category: envvars
+  description: Overrides the project directory CC uses as its working root, instead of the current working directory.
+  usage: "CLAUDE_PROJECT_DIR=<path>"
+  examples:
+    - "export CLAUDE_PROJECT_DIR=/Users/me/projects/myproject"
+  related:
+    - CLAUDE_ENV_FILE
+    - CLAUDE_CONFIG_DIR
+  gotchas:
+    - "Affects where CC looks for .claude/ and CLAUDE.md — useful when launching CC from a non-project directory."
+
+- name: CLAUDE_CONFIG_DIR
+  category: envvars
+  description: Overrides the location of the ~/.claude/ configuration directory, redirecting all config reads and writes.
+  usage: "CLAUDE_CONFIG_DIR=<path>"
+  examples:
+    - "export CLAUDE_CONFIG_DIR=/tmp/claude-test"
+  related:
+    - CLAUDE_PROJECT_DIR
+  gotchas:
+    - "Affects all config: settings.json, CLAUDE.md, skills, agents, commands, and session JSONL paths."
+    - "Useful for isolated test environments; ensure the directory exists before starting CC."
+
+- name: CLAUDE_CODE_SKIP_PROMPT_HISTORY
+  category: envvars
+  description: When set to a truthy value, disables writing user prompts to the shell prompt history.
+  usage: "CLAUDE_CODE_SKIP_PROMPT_HISTORY=1"
+  examples:
+    - "export CLAUDE_CODE_SKIP_PROMPT_HISTORY=1"
+  related:
+    - DISABLE_TELEMETRY
+  gotchas:
+    - "Only affects CC's own history writing — the shell's native history (e.g. ~/.bash_history) is separate."
+
+- name: CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR
+  category: envvars
+  description: When set, resets the working directory to the project root before each Bash tool call, preventing directory drift.
+  usage: "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1"
+  examples:
+    - "export CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1"
+  related:
+    - CLAUDE_PROJECT_DIR
+  gotchas:
+    - "Useful when Bash tool calls use cd — without this, each call starts where the previous one left off."
+
+- name: CLAUDE_CODE_USE_POWERSHELL_TOOL
+  category: envvars
+  description: Enables the PowerShell tool on Windows, replacing the Bash tool with a PowerShell executor.
+  usage: "CLAUDE_CODE_USE_POWERSHELL_TOOL=1"
+  examples:
+    - "set CLAUDE_CODE_USE_POWERSHELL_TOOL=1"
+  related:
+    - PowerShell
+  gotchas:
+    - "Intended for Windows environments — setting this on macOS/Linux has no effect."
+
+- name: SLASH_COMMAND_TOOL_CHAR_BUDGET
+  category: envvars
+  description: Sets the character budget for slash command tool output, limiting how much output is injected into context.
+  usage: "SLASH_COMMAND_TOOL_CHAR_BUDGET=<number>"
+  examples:
+    - "export SLASH_COMMAND_TOOL_CHAR_BUDGET=10000"
+  related:
+    - CLAUDE_CODE_SKIP_PROMPT_HISTORY
+  gotchas:
+    - "Increasing the budget beyond what fits in context may degrade model performance."
+
+- name: CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD
+  category: envvars
+  description: Colon-separated list of additional directories whose CLAUDE.md files are loaded into the session context.
+  usage: "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=<path>:<path>"
+  examples:
+    - "export CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=/Users/me/shared:/Users/me/libs"
+  related:
+    - CLAUDE_CONFIG_DIR
+    - CLAUDE_PROJECT_DIR
+  gotchas:
+    - "CLAUDE.md files in these directories are loaded in addition to the standard global and project files."
+    - "Order matters — files are loaded in the order directories are listed."
+
+- name: DISABLE_TELEMETRY
+  category: envvars
+  description: Disables telemetry and usage reporting sent by CC to Anthropic.
+  usage: "DISABLE_TELEMETRY=1"
+  examples:
+    - "export DISABLE_TELEMETRY=1"
+  related:
+    - CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+  gotchas:
+    - "Does not disable core API traffic — only optional telemetry events are suppressed."
+
+- name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+  category: envvars
+  description: Disables all non-essential outbound network traffic from CC, including telemetry, update checks, and analytics.
+  usage: "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
+  examples:
+    - "export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
+  related:
+    - DISABLE_TELEMETRY
+  gotchas:
+    - "Stricter than DISABLE_TELEMETRY — disables update checks and other background network activity."
+    - "Useful in air-gapped or network-restricted environments."
+
+- name: CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
+  category: envvars
+  description: Enables the experimental multi-agent team session feature, required for TeamCreate, SendMessage, and TeammateIdle hooks.
+  usage: "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1"
+  examples:
+    - "export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1"
+  related:
+    - TeamCreate
+    - TeammateIdle
+    - TaskCompleted
+  gotchas:
+    - "Experimental — API and behavior may change between CC versions."
+    - "Team sessions are significantly more expensive per task than single-agent sessions."
