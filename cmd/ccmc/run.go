@@ -95,14 +95,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "inventory":
 		return runInventory(rest, stdout, stderr)
 	case "eval":
-		fmt.Fprintln(stderr, "ccmc eval: not yet implemented")
-		return 2
+		return runEval(rest, stdout, stderr, os.Stdin)
 	case "install":
-		fmt.Fprintln(stderr, "ccmc install: not yet implemented")
-		return 2
+		return runInstall(rest, stdout, stderr)
 	case "tools":
-		fmt.Fprintln(stderr, "ccmc tools: not yet implemented")
-		return 2
+		return runTools(rest, stdout, stderr, os.Stdin)
 	case "iterm-install":
 		fmt.Fprintln(stderr, "ccmc iterm-install: not yet implemented")
 		return 2

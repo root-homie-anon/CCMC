@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -19,6 +20,7 @@ import (
 	"ccmc/internal/config"
 	"ccmc/internal/daemon"
 	"ccmc/internal/hooks"
+	"ccmc/internal/integrator"
 	"ccmc/pkg/ccmc"
 )
 
@@ -1071,5 +1073,423 @@ func TestRun_InventoryUnknownSubcommand(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "frobs") {
 		t.Errorf("expected subcommand name in error message; got: %q", errOut)
+	}
+}
+
+// ── eval / install / tools tests ──────────────────────────────────────────────
+
+// runEvalCmd calls runEval directly with controlled stdin, returning captured I/O.
+func runEvalCmd(args []string, stdinInput string) (stdout, stderr string, code int) {
+	var outBuf, errBuf bytes.Buffer
+	stdinReader := strings.NewReader(stdinInput)
+	code = runEval(args, &outBuf, &errBuf, stdinReader)
+	return outBuf.String(), errBuf.String(), code
+}
+
+// runToolsCmd calls runTools directly with controlled stdin.
+func runToolsCmd(args []string, stdinInput string) (stdout, stderr string, code int) {
+	var outBuf, errBuf bytes.Buffer
+	stdinReader := strings.NewReader(stdinInput)
+	code = runTools(args, &outBuf, &errBuf, stdinReader)
+	return outBuf.String(), errBuf.String(), code
+}
+
+// evalResult is a canned EvalResult used across several tests.
+var canned = ccmc.EvalResult{
+	ToolName:       "foo",
+	RepoURL:        "https://github.com/anthropics/foo",
+	Capability:     "does stuff",
+	GapFilled:      "fills a gap",
+	Dependencies:   []string{"node"},
+	RiskAssessment: "low",
+	Recommendation: "install",
+}
+
+// TestRun_EvalHappyPath stubs ghFetchFunc and evalFunc, supplies "n" to the
+// install prompt, and asserts exit 0 with EvalResult fields in stdout.
+func TestRun_EvalHappyPath(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+
+	origFetch := ghFetchFunc
+	origEval := evalFunc
+	t.Cleanup(func() { ghFetchFunc = origFetch; evalFunc = origEval })
+
+	ghFetchFunc = func(_ context.Context, _, _ string) (ccmc.EvalContext, error) {
+		return ccmc.EvalContext{Owner: "anthropics", Repo: "foo"}, nil
+	}
+	evalFunc = func(_ context.Context, _ string, _ ccmc.EvalContext, _ string) (ccmc.EvalResult, error) {
+		return canned, nil
+	}
+
+	out, errOut, code := runEvalCmd([]string{"anthropics/foo"}, "n\n")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
+	}
+	for _, want := range []string{"foo", "does stuff", "fills a gap", "install"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in stdout; got:\n%s", want, out)
+		}
+	}
+}
+
+// TestRun_EvalNoPrompt asserts that --no-prompt skips the interactive prompt
+// entirely and exits 0.
+func TestRun_EvalNoPrompt(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+
+	origFetch := ghFetchFunc
+	origEval := evalFunc
+	t.Cleanup(func() { ghFetchFunc = origFetch; evalFunc = origEval })
+
+	ghFetchFunc = func(_ context.Context, _, _ string) (ccmc.EvalContext, error) {
+		return ccmc.EvalContext{}, nil
+	}
+	evalFunc = func(_ context.Context, _ string, _ ccmc.EvalContext, _ string) (ccmc.EvalResult, error) {
+		return canned, nil
+	}
+
+	// Empty stdin — if the prompt is shown and blocks on a read, this test would
+	// return EOF immediately without hanging. The test just asserts exit 0.
+	out, errOut, code := runEvalCmd([]string{"--no-prompt", "anthropics/foo"}, "")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q; stdout: %q", code, errOut, out)
+	}
+	// The prompt string must not appear in stdout.
+	if strings.Contains(out, "Install?") {
+		t.Errorf("expected no Install? prompt when --no-prompt given; stdout:\n%s", out)
+	}
+}
+
+// TestRun_EvalAcceptInstall supplies "y" to the prompt and asserts the installer
+// seam is invoked.
+func TestRun_EvalAcceptInstall(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+
+	origFetch := ghFetchFunc
+	origEval := evalFunc
+	origInstall := installFunc
+	t.Cleanup(func() { ghFetchFunc = origFetch; evalFunc = origEval; installFunc = origInstall })
+
+	ghFetchFunc = func(_ context.Context, _, _ string) (ccmc.EvalContext, error) {
+		return ccmc.EvalContext{Owner: "anthropics", Repo: "foo"}, nil
+	}
+	evalFunc = func(_ context.Context, _ string, _ ccmc.EvalContext, _ string) (ccmc.EvalResult, error) {
+		return canned, nil
+	}
+
+	installerCalled := false
+	installFunc = func(_ context.Context, _ config.Config, src integrator.InstallSource) (ccmc.InstallResult, error) {
+		installerCalled = true
+		return ccmc.InstallResult{Name: "foo", Type: "mcp-stdio", Scope: "global"}, nil
+	}
+
+	_, errOut, code := runEvalCmd([]string{"anthropics/foo"}, "y\n")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
+	}
+	if !installerCalled {
+		t.Error("expected installer to be called when user answers y")
+	}
+}
+
+// TestRun_EvalNoAPIKey asserts that ErrNoAPIKey from the evaluator exits 1 with
+// a helpful message about keymaster.
+func TestRun_EvalNoAPIKey(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+
+	origFetch := ghFetchFunc
+	origEval := evalFunc
+	t.Cleanup(func() { ghFetchFunc = origFetch; evalFunc = origEval })
+
+	ghFetchFunc = func(_ context.Context, _, _ string) (ccmc.EvalContext, error) {
+		return ccmc.EvalContext{}, nil
+	}
+	evalFunc = func(_ context.Context, _ string, _ ccmc.EvalContext, _ string) (ccmc.EvalResult, error) {
+		return ccmc.EvalResult{}, integrator.ErrNoAPIKey
+	}
+
+	_, errOut, code := runEvalCmd([]string{"anthropics/foo"}, "")
+	if code != 1 {
+		t.Fatalf("expected exit 1, got %d; stderr: %q", code, errOut)
+	}
+	if !strings.Contains(errOut, "keymaster") {
+		t.Errorf("expected keymaster hint in stderr; got: %q", errOut)
+	}
+}
+
+// TestRun_InstallHappyPath stubs installFunc and asserts exit 0 with result printed.
+func TestRun_InstallHappyPath(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+
+	origInstall := installFunc
+	t.Cleanup(func() { installFunc = origInstall })
+
+	installFunc = func(_ context.Context, _ config.Config, src integrator.InstallSource) (ccmc.InstallResult, error) {
+		return ccmc.InstallResult{
+			Name:       "foo",
+			Type:       "mcp-stdio",
+			SourceURL:  src.URL,
+			Scope:      "global",
+			ClonePath:  "/tmp/foo",
+			ConfigPath: "/tmp/settings.json",
+		}, nil
+	}
+
+	var outBuf, errBuf bytes.Buffer
+	code := runInstall([]string{"anthropics/foo", "--scope", "global"}, &outBuf, &errBuf)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errBuf.String())
+	}
+	out := outBuf.String()
+	for _, want := range []string{"foo", "mcp-stdio", "global"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in install output; got:\n%s", want, out)
+		}
+	}
+}
+
+// TestRun_InstallAlreadyInstalled asserts exit 1 with --force hint when the
+// installer returns ErrToolAlreadyInstalled.
+func TestRun_InstallAlreadyInstalled(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+
+	origInstall := installFunc
+	t.Cleanup(func() { installFunc = origInstall })
+
+	installFunc = func(_ context.Context, _ config.Config, _ integrator.InstallSource) (ccmc.InstallResult, error) {
+		return ccmc.InstallResult{}, fmt.Errorf("%w: anthropics/foo at scope global", integrator.ErrToolAlreadyInstalled)
+	}
+
+	var outBuf, errBuf bytes.Buffer
+	code := runInstall([]string{"anthropics/foo"}, &outBuf, &errBuf)
+	if code != 1 {
+		t.Fatalf("expected exit 1, got %d; stderr: %q", code, errBuf.String())
+	}
+	if !strings.Contains(errBuf.String(), "--force") {
+		t.Errorf("expected --force hint in stderr; got: %q", errBuf.String())
+	}
+}
+
+// fakeManager is a minimal managerIface implementation for tools tests.
+type fakeManager struct {
+	entries      []ccmc.ToolRegistryEntry
+	removeCalled string
+	deleteClone  bool
+	updateCalled []string
+}
+
+func (f *fakeManager) List() ([]ccmc.ToolRegistryEntry, error) {
+	return f.entries, nil
+}
+
+func (f *fakeManager) Get(name string) (ccmc.ToolRegistryEntry, error) {
+	for _, e := range f.entries {
+		if e.Name == name {
+			return e, nil
+		}
+	}
+	return ccmc.ToolRegistryEntry{}, fmt.Errorf("%w: %s", integrator.ErrToolNotFound, name)
+}
+
+func (f *fakeManager) Remove(name string, deleteClone bool) error {
+	f.removeCalled = name
+	f.deleteClone = deleteClone
+	return nil
+}
+
+func (f *fakeManager) Update(name string) error {
+	f.updateCalled = append(f.updateCalled, name)
+	return nil
+}
+
+// TestRun_ToolsLsEmpty verifies "ccmc tools ls" with an empty registry exits 0
+// and prints "no tools installed".
+func TestRun_ToolsLsEmpty(t *testing.T) {
+	fake := &fakeManager{}
+	origFactory := managerFactory
+	t.Cleanup(func() { managerFactory = origFactory })
+	managerFactory = func(_ string) managerIface { return fake }
+
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+
+	out, errOut, code := runToolsCmd([]string{"ls"}, "")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
+	}
+	if !strings.Contains(out, "no tools installed") {
+		t.Errorf("expected 'no tools installed'; got:\n%s", out)
+	}
+}
+
+// TestRun_ToolsLsPopulated asserts both tool names appear in the table.
+func TestRun_ToolsLsPopulated(t *testing.T) {
+	fake := &fakeManager{
+		entries: []ccmc.ToolRegistryEntry{
+			{Name: "alpha", Type: "mcp-stdio", Scope: "global", InstalledAt: "2026-01-01T00:00:00Z"},
+			{Name: "beta", Type: "skill", Scope: "global", InstalledAt: "2026-01-02T00:00:00Z"},
+		},
+	}
+	origFactory := managerFactory
+	t.Cleanup(func() { managerFactory = origFactory })
+	managerFactory = func(_ string) managerIface { return fake }
+
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+
+	out, errOut, code := runToolsCmd([]string{"ls"}, "")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
+	}
+	for _, want := range []string{"alpha", "beta", "mcp-stdio", "skill"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in ls output; got:\n%s", want, out)
+		}
+	}
+}
+
+// TestRun_ToolsRmConfirmed supplies "y" and asserts Remove called with deleteClone=true.
+func TestRun_ToolsRmConfirmed(t *testing.T) {
+	fake := &fakeManager{
+		entries: []ccmc.ToolRegistryEntry{
+			{Name: "alpha", Type: "mcp-stdio", Scope: "global", ClonePath: "/tmp/alpha"},
+		},
+	}
+	origFactory := managerFactory
+	t.Cleanup(func() { managerFactory = origFactory })
+	managerFactory = func(_ string) managerIface { return fake }
+
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+
+	_, errOut, code := runToolsCmd([]string{"rm", "alpha"}, "y\n")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
+	}
+	if fake.removeCalled != "alpha" {
+		t.Errorf("expected Remove called for 'alpha'; got: %q", fake.removeCalled)
+	}
+	if !fake.deleteClone {
+		t.Error("expected deleteClone=true when user confirms")
+	}
+}
+
+// TestRun_ToolsRmNoPrompt asserts --no-prompt skips confirmation and calls Remove.
+func TestRun_ToolsRmNoPrompt(t *testing.T) {
+	fake := &fakeManager{
+		entries: []ccmc.ToolRegistryEntry{
+			{Name: "alpha", Type: "mcp-stdio", Scope: "global"},
+		},
+	}
+	origFactory := managerFactory
+	t.Cleanup(func() { managerFactory = origFactory })
+	managerFactory = func(_ string) managerIface { return fake }
+
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+
+	// Empty stdin — if the prompt were shown, bufio.Reader would get EOF without
+	// a newline and return "", which would answer "no". --no-prompt must skip all of that.
+	_, errOut, code := runToolsCmd([]string{"rm", "--no-prompt", "alpha"}, "")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
+	}
+	if fake.removeCalled != "alpha" {
+		t.Errorf("expected Remove called; got: %q", fake.removeCalled)
+	}
+}
+
+// TestRun_ToolsRmKeepClone asserts --keep-clone calls Remove with deleteClone=false.
+func TestRun_ToolsRmKeepClone(t *testing.T) {
+	fake := &fakeManager{
+		entries: []ccmc.ToolRegistryEntry{
+			{Name: "alpha", Type: "mcp-stdio", Scope: "global", ClonePath: "/tmp/alpha"},
+		},
+	}
+	origFactory := managerFactory
+	t.Cleanup(func() { managerFactory = origFactory })
+	managerFactory = func(_ string) managerIface { return fake }
+
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+
+	_, errOut, code := runToolsCmd([]string{"rm", "--keep-clone", "--no-prompt", "alpha"}, "")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
+	}
+	if fake.deleteClone {
+		t.Error("expected deleteClone=false with --keep-clone")
+	}
+}
+
+// TestRun_ToolsUpdateAll asserts that all tools with a clone_path have Update called.
+func TestRun_ToolsUpdateAll(t *testing.T) {
+	fake := &fakeManager{
+		entries: []ccmc.ToolRegistryEntry{
+			{Name: "alpha", ClonePath: "/tmp/alpha"},
+			{Name: "beta", ClonePath: ""},  // no clone — should be skipped
+			{Name: "gamma", ClonePath: "/tmp/gamma"},
+		},
+	}
+	origFactory := managerFactory
+	t.Cleanup(func() { managerFactory = origFactory })
+	managerFactory = func(_ string) managerIface { return fake }
+
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+
+	out, errOut, code := runToolsCmd([]string{"update"}, "")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q; stdout: %q", code, errOut, out)
+	}
+	updated := make(map[string]bool)
+	for _, n := range fake.updateCalled {
+		updated[n] = true
+	}
+	if !updated["alpha"] {
+		t.Error("expected Update called for alpha")
+	}
+	if updated["beta"] {
+		t.Error("expected Update NOT called for beta (no clone_path)")
+	}
+	if !updated["gamma"] {
+		t.Error("expected Update called for gamma")
+	}
+}
+
+// TestRun_ToolsUpdateSingle asserts "ccmc tools update foo" calls Update only for foo.
+func TestRun_ToolsUpdateSingle(t *testing.T) {
+	fake := &fakeManager{
+		entries: []ccmc.ToolRegistryEntry{
+			{Name: "foo", ClonePath: "/tmp/foo"},
+			{Name: "bar", ClonePath: "/tmp/bar"},
+		},
+	}
+	origFactory := managerFactory
+	t.Cleanup(func() { managerFactory = origFactory })
+	managerFactory = func(_ string) managerIface { return fake }
+
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+
+	out, errOut, code := runToolsCmd([]string{"update", "foo"}, "")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
+	}
+	if len(fake.updateCalled) != 1 || fake.updateCalled[0] != "foo" {
+		t.Errorf("expected Update called only for foo; got: %v", fake.updateCalled)
+	}
+	if !strings.Contains(out, "foo") {
+		t.Errorf("expected foo in output; got: %q", out)
 	}
 }
