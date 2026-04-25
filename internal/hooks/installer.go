@@ -1,7 +1,6 @@
 package hooks
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -61,9 +60,10 @@ type InstallerOptions struct {
 	// If empty, config.CcmcSocketPath() is used.
 	SocketPath string
 
-	// TempDir overrides the directory used for atomic temp-file writes.
-	// If empty, filepath.Dir(SettingsPath) is used. Tests point this at a
-	// writable location when simulating write failures in read-only dirs.
+	// TempDir is retained for API compatibility but is no longer used; atomic
+	// writes are delegated to config.WriteSettings which derives tempDir from
+	// filepath.Dir(SettingsPath). Tests that need to induce a write failure
+	// should place SettingsPath itself in a read-only directory.
 	TempDir string
 }
 
@@ -72,13 +72,13 @@ type InstallerOptions struct {
 // times: the second run produces a byte-for-byte identical file (verified by
 // the installer_test.go idempotency test).
 //
-// Write safety: the new content is written to a temp file in the same directory
-// as settings.json, then os.Rename'd into place. If the process is killed
-// mid-write the original file is never touched.
+// Write safety: delegated to config.WriteSettings, which writes to a temp file
+// in the same directory as settings.json, then os.Rename's into place. If the
+// process is killed mid-write the original file is never touched.
 //
-// Backup: ~/.claude/settings.json.bak is written before every write, containing
-// the exact bytes that were in settings.json before this call. If no write is
-// needed (idempotent no-op) no backup is written.
+// Backup: config.WriteSettings writes ~/.claude/settings.json.bak before every
+// write, containing the exact bytes that were in settings.json before this call.
+// If no write is needed (idempotent no-op) no backup is written.
 func Install(opts InstallerOptions) error {
 	settingsPath := opts.SettingsPath
 	if settingsPath == "" {
@@ -108,29 +108,13 @@ func Install(opts InstallerOptions) error {
 		}
 	}
 
-	// ── 1. Symlink guard on settingsPath before any read ─────────────────────
-	if err := lstatGuard(settingsPath); err != nil {
-		return fmt.Errorf("installer: settings.json symlink check: %w", err)
-	}
-
-	// ── 2. Read existing settings (or start with empty object) ───────────────
-	original, err := readFileOrEmpty(settingsPath)
+	// ── 1. Read existing settings (symlink guard + parse delegated to ReadSettings) ──
+	root, err := config.ReadSettings(settingsPath)
 	if err != nil {
 		return fmt.Errorf("installer: read settings: %w", err)
 	}
 
-	// ── 3. Decode into a generic map so we preserve unknown top-level keys ───
-	var root map[string]json.RawMessage
-	if len(original) > 0 {
-		if err := json.Unmarshal(original, &root); err != nil {
-			return fmt.Errorf("installer: parse settings.json: %w", err)
-		}
-	}
-	if root == nil {
-		root = make(map[string]json.RawMessage)
-	}
-
-	// ── 4. Decode the existing "hooks" block (or start with empty map) ───────
+	// ── 2. Decode the existing "hooks" block (or start with empty map) ───────
 	var hooksMap map[string][]hookGroup
 	if raw, ok := root["hooks"]; ok {
 		if err := json.Unmarshal(raw, &hooksMap); err != nil {
@@ -141,54 +125,25 @@ func Install(opts InstallerOptions) error {
 		hooksMap = make(map[string][]hookGroup)
 	}
 
-	// ── 5. Merge CCMC entries ─────────────────────────────────────────────────
+	// ── 3. Merge CCMC entries ─────────────────────────────────────────────────
 	changed := mergeEntries(hooksMap, socketPath)
 	if !changed {
 		// Already up to date — no write, no backup.
 		return nil
 	}
 
-	// ── 6. Re-encode hooks block and inject back into root ───────────────────
+	// ── 4. Re-encode hooks block and inject back into root ───────────────────
 	hooksRaw, err := json.Marshal(hooksMap)
 	if err != nil {
 		return fmt.Errorf("installer: encode hooks block: %w", err)
 	}
 	root["hooks"] = json.RawMessage(hooksRaw)
 
-	// ── 7. Encode full settings with stable key order ─────────────────────────
-	newBytes, err := marshalStable(root)
-	if err != nil {
-		return fmt.Errorf("installer: encode settings: %w", err)
-	}
-
-	// ── 8. Symlink guard on bakPath before any read or write ─────────────────
-	bakPath := settingsPath + ".bak"
-	if err := lstatGuard(bakPath); err != nil {
-		return fmt.Errorf("installer: .bak symlink check: %w", err)
-	}
-
-	// ── 9. Rotate .bak if it differs from the current settings bytes ─────────
-	// A fixed .bak slot destroys the pre-first-CCMC state on every subsequent
-	// run. Rotation bounds backup count by the number of meaningful changes:
-	// if the existing .bak already matches original, no information is lost by
-	// overwriting it, so we skip rotation.
-	if existingBak, readErr := os.ReadFile(bakPath); readErr == nil {
-		if !bytes.Equal(existingBak, original) {
-			ts := time.Now().Unix()
-			rotatedPath := fmt.Sprintf("%s.%d", bakPath, ts)
-			if renameErr := os.Rename(bakPath, rotatedPath); renameErr == nil {
-				fmt.Fprintf(os.Stderr, "installer: settings.json.bak rotated to settings.json.bak.%d\n", ts)
-			}
-		}
-	}
-
-	// ── 10. Write .bak of the pre-write state ────────────────────────────────
-	if err := writeAtomic(bakPath, tempDir, original); err != nil {
-		return fmt.Errorf("installer: write backup: %w", err)
-	}
-
-	// ── 11. Atomic write of new settings ─────────────────────────────────────
-	if err := writeAtomic(settingsPath, tempDir, newBytes); err != nil {
+	// ── 5. Atomic write via config.WriteSettings ─────────────────────────────
+	// WriteSettings handles: symlink guards on both path and .bak, .bak rotation,
+	// atomic temp+rename. The encoding (MarshalIndent + trailing newline) matches
+	// what marshalStable produced, preserving byte-for-byte idempotency.
+	if err := config.WriteSettings(settingsPath, root); err != nil {
 		return fmt.Errorf("installer: write settings: %w", err)
 	}
 
@@ -260,82 +215,6 @@ func buildCommand(event, socketPath string) string {
 	)
 }
 
-// marshalStable encodes a map[string]json.RawMessage into indented JSON with
-// keys in a deterministic order. The key order is: "hooks" is moved to appear
-// after any alphabetically earlier keys, and the rest are sorted. In practice
-// for settings.json the exact order is whatever json.Marshal produces for a
-// sorted-key map — Go's json.Marshal sorts map keys alphabetically, which is
-// stable across runs and sufficient for the byte-for-byte idempotency guarantee.
-func marshalStable(root map[string]json.RawMessage) ([]byte, error) {
-	b, err := json.MarshalIndent(root, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	return append(b, '\n'), nil
-}
-
-// readFileOrEmpty reads the file at path and returns its bytes. If the file
-// does not exist it returns a nil slice (not an error). Any other error
-// (permission denied, I/O failure) is returned as-is.
-func readFileOrEmpty(path string) ([]byte, error) {
-	b, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	return b, err
-}
-
-// writeAtomic writes data to dst by first writing to a temp file in tempDir,
-// then calling os.Rename. This guarantees the destination is never partially
-// written even if the process is killed mid-write.
-func writeAtomic(dst, tempDir string, data []byte) error {
-	f, err := os.CreateTemp(tempDir, ".ccmc-install-*")
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
-	}
-	tmpPath := f.Name()
-
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("write temp file: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("sync temp file: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("close temp file: %w", err)
-	}
-
-	if err := os.Rename(tmpPath, dst); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("rename temp to %s: %w", dst, err)
-	}
-	return nil
-}
-
-// lstatGuard checks path with os.Lstat and returns an error if:
-//   - the path exists and is a symlink (mirrors daemon's bindSocket / writePIDFile pattern)
-//   - Lstat returns any error other than ENOENT
-//
-// A missing path (ENOENT) is not an error here — callers handle that case themselves.
-func lstatGuard(path string) error {
-	fi, err := os.Lstat(path)
-	if err == nil {
-		if fi.Mode().Type()&os.ModeSymlink != 0 {
-			return fmt.Errorf("path %s is a symlink — refusing to proceed", path)
-		}
-		return nil
-	}
-	if os.IsNotExist(err) {
-		return nil
-	}
-	return fmt.Errorf("lstat %s: %w", path, err)
-}
-
 // shellQuote wraps s in single quotes safe for use in a POSIX sh -c string.
 // Any single-quote character inside s is escaped via the '\'' idiom so the
 // quoting is robust against arbitrary input (including paths with spaces,
@@ -359,3 +238,7 @@ func HashFile(path string) (string, error) {
 	}
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
+
+// The unexported helpers lstatGuard, readFileOrEmpty, writeAtomic, and
+// marshalStable were extracted to internal/config/settings.go. Callers use
+// config.ReadSettings and config.WriteSettings instead.
