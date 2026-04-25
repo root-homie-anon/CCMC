@@ -683,6 +683,168 @@ func TestServer_StaleSocketFile_Removed(t *testing.T) {
 	}
 }
 
+// ─── N1: ensureCcmcDir bootstrap ─────────────────────────────────────────────
+
+// TestServer_EnsureCcmcDir_FreshInstall verifies that Run creates ~/.ccmc (or
+// the test-equivalent ccmc dir) at 0o700 when it does not yet exist, and that
+// the server starts and accepts connections successfully.
+func TestServer_EnsureCcmcDir_FreshInstall(t *testing.T) {
+	// Use os.MkdirTemp with a short prefix so the resulting path (including the
+	// socket filename) stays under the 104-byte macOS SUN_LEN limit. The ccmc
+	// dir is a non-existent subdirectory inside it that Run must create.
+	root, err := os.MkdirTemp("", "ccmc")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(root) })
+
+	ccmcDir := filepath.Join(root, "c")   // short name to save path budget
+	sockPath := filepath.Join(ccmcDir, "d.sock")
+	pidPath := filepath.Join(ccmcDir, "d.pid")
+
+	// Confirm ccmcDir does not exist before Run.
+	if _, err := os.Lstat(ccmcDir); !os.IsNotExist(err) {
+		t.Fatalf("precondition: ccmcDir should not exist, got: %v", err)
+	}
+
+	reg := newReg(t)
+	s := daemon.New(reg, buildHookHandlers(reg),
+		daemon.WithSocketPath(sockPath),
+		daemon.WithPIDPath(pidPath),
+		daemon.WithIdleTimeout(30*time.Minute),
+	)
+
+	cancel, done := startServer(t, s)
+	defer func() { cancel(); <-done }()
+
+	// Directory must now exist with exactly 0o700.
+	fi, err := os.Lstat(ccmcDir)
+	if err != nil {
+		t.Fatalf("ccmcDir not created by Run: %v", err)
+	}
+	if fi.Mode().Perm() != 0o700 {
+		t.Fatalf("ccmcDir mode = %04o, want 0700", fi.Mode().Perm())
+	}
+
+	// Server must respond.
+	client := unixClient(sockPath)
+	resp := do(t, client, http.MethodGet, "/status", "")
+	slurp(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /status after fresh-install bootstrap: got %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestServer_EnsureCcmcDir_WideModeAutoNarrow verifies that a pre-existing ccmc
+// dir with mode 0o755 is narrowed to 0o700 at startup without refusing to start.
+func TestServer_EnsureCcmcDir_WideModeAutoNarrow(t *testing.T) {
+	root, err := os.MkdirTemp("", "ccmc")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(root) })
+
+	ccmcDir := filepath.Join(root, "c")   // short name to save path budget
+
+	// Pre-create the directory at 0o755 to simulate a prior code path with a
+	// broad umask.
+	if err := os.Mkdir(ccmcDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	sockPath := filepath.Join(ccmcDir, "d.sock")
+	pidPath := filepath.Join(ccmcDir, "d.pid")
+
+	reg := newReg(t)
+	s := daemon.New(reg, buildHookHandlers(reg),
+		daemon.WithSocketPath(sockPath),
+		daemon.WithPIDPath(pidPath),
+		daemon.WithIdleTimeout(30*time.Minute),
+	)
+
+	cancel, done := startServer(t, s)
+	defer func() { cancel(); <-done }()
+
+	// Directory mode must be narrowed to 0o700.
+	fi, err := os.Lstat(ccmcDir)
+	if err != nil {
+		t.Fatalf("Lstat ccmcDir: %v", err)
+	}
+	if fi.Mode().Perm() != 0o700 {
+		t.Fatalf("ccmcDir mode after startup = %04o, want 0700 (auto-narrow failed)", fi.Mode().Perm())
+	}
+
+	// Server must be reachable.
+	client := unixClient(sockPath)
+	resp := do(t, client, http.MethodGet, "/status", "")
+	slurp(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /status after wide-mode auto-narrow: got %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestServer_EnsureCcmcDir_SymlinkRefused verifies that Run returns an error
+// when the ccmc dir path is a symlink to a real directory, and that the symlink
+// target is not chmod'd.
+func TestServer_EnsureCcmcDir_SymlinkRefused(t *testing.T) {
+	root, err := os.MkdirTemp("", "ccmc")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(root) })
+
+	realDir := filepath.Join(root, "r")
+	if err := os.Mkdir(realDir, 0o700); err != nil {
+		t.Fatalf("mkdir realDir: %v", err)
+	}
+
+	// Place a symlink where the ccmc dir should be.
+	ccmcDirLink := filepath.Join(root, "c")
+	if err := os.Symlink(realDir, ccmcDirLink); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	sockPath := filepath.Join(ccmcDirLink, "d.sock")
+	pidPath := filepath.Join(ccmcDirLink, "d.pid")
+
+	reg := newReg(t)
+	s := daemon.New(reg, buildHookHandlers(reg),
+		daemon.WithSocketPath(sockPath),
+		daemon.WithPIDPath(pidPath),
+		daemon.WithIdleTimeout(30*time.Minute),
+	)
+
+	runErr := s.Run(context.Background())
+	if runErr == nil {
+		t.Fatal("Run returned nil, want error when ccmc dir is a symlink")
+	}
+
+	// The symlink target must not have been chmod'd — the symlink guard must
+	// fire before any chmod attempt.
+	fi, lstatErr := os.Lstat(realDir)
+	if lstatErr != nil {
+		t.Fatalf("Lstat realDir: %v", lstatErr)
+	}
+	if fi.Mode().Perm() != 0o700 {
+		t.Fatalf("realDir mode changed to %04o — symlink target was chmod'd, it must not be", fi.Mode().Perm())
+	}
+
+	// The symlink itself must still be in place.
+	lfi, lstatErr2 := os.Lstat(ccmcDirLink)
+	if lstatErr2 != nil {
+		t.Fatalf("Lstat ccmcDirLink: %v", lstatErr2)
+	}
+	if lfi.Mode().Type()&os.ModeSymlink == 0 {
+		t.Fatal("ccmc dir symlink was removed or replaced — it should be untouched")
+	}
+}
+
+// TestServer_EnsureCcmcDir_WrongOwner — skipped: verifying wrong-owner rejection
+// requires creating a directory owned by a different uid, which demands either
+// root privileges or a second OS user. Neither is available in the standard test
+// environment. The ownership check code path (Stat_t.Uid != Getuid()) is covered
+// by code review; a manual integration test under sudo is the right vehicle.
+
 // ─── Stale PID file handling ──────────────────────────────────────────────────
 
 // TestServer_StalePIDFile_Overwrite verifies that a PID file from a prior

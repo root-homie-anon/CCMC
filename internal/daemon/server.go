@@ -126,8 +126,8 @@ func New(reg *Registry, hookHandlers map[string]http.HandlerFunc, opts ...Option
 // SIGTERM/SIGINT handling lives here so the daemon works standalone without a
 // wrapper CLI command.
 func (s *Server) Run(ctx context.Context) error {
-	// ── 0. Verify ~/.ccmc/ directory integrity ────────────────────────────────
-	if err := verifyCcmcDir(filepath.Dir(s.socketPath)); err != nil {
+	// ── 0. Bootstrap and verify ~/.ccmc/ directory integrity ─────────────────
+	if err := ensureCcmcDir(filepath.Dir(s.socketPath)); err != nil {
 		return fmt.Errorf("daemon: %w", err)
 	}
 
@@ -369,11 +369,15 @@ func (s *Server) shouldIdleShutdown() bool {
 // resolves to a symlink the daemon refuses to start — a same-uid attacker could
 // have placed the symlink to redirect socket creation to an arbitrary path.
 func (s *Server) bindSocket() (net.Listener, error) {
-	// Symlink guard: refuse to act on a symlink at the socket path.
+	// Symlink guard: refuse to act on a symlink at the socket path. Any Lstat
+	// error other than ENOENT (e.g. EACCES, EIO) is also returned — silently
+	// skipping it would defer failure to net.Listen with a less informative error.
 	if fi, err := os.Lstat(s.socketPath); err == nil {
 		if fi.Mode().Type()&os.ModeSymlink != 0 {
 			return nil, fmt.Errorf("socket path %s is a symlink — refusing to start", s.socketPath)
 		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("lstat socket path %s: %w", s.socketPath, err)
 	}
 
 	// First attempt: bind directly.
@@ -417,11 +421,14 @@ func (s *Server) bindSocket() (net.Listener, error) {
 // an arbitrary file. The open uses O_NOFOLLOW so the kernel also refuses to
 // follow a symlink that races the Lstat check.
 func (s *Server) writePIDFile() error {
-	// Symlink guard: refuse if the PID path is already a symlink.
+	// Symlink guard: refuse if the PID path is already a symlink. Any Lstat
+	// error other than ENOENT is also returned — same rationale as bindSocket.
 	if fi, err := os.Lstat(s.pidPath); err == nil {
 		if fi.Mode().Type()&os.ModeSymlink != 0 {
 			return fmt.Errorf("PID path %s is a symlink — refusing to write", s.pidPath)
 		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("lstat PID path %s: %w", s.pidPath, err)
 	}
 
 	// Read existing PID file without following symlinks (O_NOFOLLOW).
@@ -479,15 +486,26 @@ func (s *Server) removePIDFile() {
 	os.Remove(s.pidPath)
 }
 
-// verifyCcmcDir checks that dir (the ~/.ccmc directory) exists, is a real
-// directory (not a symlink), is owned by the current user, and has mode 0o700.
-// This runs at daemon startup before any socket or PID file operations so that
-// a misconfigured or attacker-controlled parent directory is caught early.
-func verifyCcmcDir(dir string) error {
+// ensureCcmcDir bootstraps dir (the ~/.ccmc directory) at startup. It creates
+// the directory if absent, then verifies it is a real directory owned by the
+// current user. If the directory already exists with a mode wider than 0o700,
+// and it passes the symlink and ownership checks, the mode is silently narrowed
+// rather than refusing to start — this corrects dirs created by an earlier code
+// path that used a broader umask. A symlink or wrong owner is always a hard
+// failure because those conditions require human investigation.
+func ensureCcmcDir(dir string) error {
+	// Create the directory if it does not exist. MkdirAll is a no-op when the
+	// dir already exists, so this is safe to call unconditionally.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create ccmc dir %s: %w", dir, err)
+	}
+
 	fi, err := os.Lstat(dir)
 	if err != nil {
 		return fmt.Errorf("stat ccmc dir %s: %w", dir, err)
 	}
+	// Symlink at the ccmc dir location is always refused — an attacker could
+	// have placed it to redirect all daemon state to an arbitrary path.
 	if fi.Mode().Type()&os.ModeSymlink != 0 {
 		return fmt.Errorf("ccmc dir %s is a symlink — refusing to start", dir)
 	}
@@ -502,8 +520,14 @@ func verifyCcmcDir(dir string) error {
 	if uint32(os.Getuid()) != stat.Uid {
 		return fmt.Errorf("ccmc dir %s is owned by uid %d, not current uid %d", dir, stat.Uid, os.Getuid())
 	}
+	// Auto-narrow the mode if it is wider than 0o700. This corrects directories
+	// that were created by an earlier code path using a broader umask (e.g.
+	// 0o755). Only reached after the symlink and ownership guards above, so the
+	// chmod target is known to be a real directory we own.
 	if fi.Mode().Perm() != 0o700 {
-		return fmt.Errorf("ccmc dir %s has mode %04o, want 0700", dir, fi.Mode().Perm())
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return fmt.Errorf("chmod ccmc dir %s to 0700: %w", dir, err)
+		}
 	}
 	return nil
 }
