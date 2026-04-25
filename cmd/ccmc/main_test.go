@@ -904,3 +904,172 @@ func TestLaunchCmd_FileNotDir(t *testing.T) {
 		t.Errorf("expected non-empty stderr for file arg")
 	}
 }
+
+// ── ccmc inventory tests ───────────────────────────────────────────────────────
+
+// buildInventoryFixture creates a minimal ~/.claude/ directory tree under root
+// with one entry of every category so inventory tests can assert content.
+// Layout:
+//
+//	root/
+//	  settings.json            — one MCP entry + one hook event
+//	  skills/test-skill/SKILL.md
+//	  commands/greet.md
+//	  agents/helper.md
+//	  plugins/my-plugin/       — empty dir plugin
+func buildInventoryFixture(t *testing.T, root string) {
+	t.Helper()
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustMkdir := func(path string) {
+		must(os.MkdirAll(path, 0o755))
+	}
+	mustWriteFile := func(path, content string) {
+		must(os.MkdirAll(filepath.Dir(path), 0o755))
+		must(os.WriteFile(path, []byte(content), 0o644))
+	}
+
+	// settings.json: one MCP (stdio) + one hook event (PostToolUse).
+	mustWriteFile(filepath.Join(root, "settings.json"), `{
+  "mcpServers": {
+    "fixture-mcp": {"command": "node", "args": ["server.js"]}
+  },
+  "hooks": {
+    "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "echo"}]}]
+  }
+}`)
+
+	// Skill.
+	mustWriteFile(filepath.Join(root, "skills", "test-skill", "SKILL.md"), `---
+name: test-skill
+description: A fixture skill for testing
+user-invocable: true
+---
+Skill body here.
+`)
+
+	// Command.
+	mustWriteFile(filepath.Join(root, "commands", "greet.md"), `---
+name: greet
+description: Say hello
+---
+/greet body
+`)
+
+	// Agent.
+	mustWriteFile(filepath.Join(root, "agents", "helper.md"), `---
+name: helper
+description: A helper agent
+model: claude-sonnet-4-6
+---
+Agent body.
+`)
+
+	// Plugin (directory).
+	mustMkdir(filepath.Join(root, "plugins", "my-plugin"))
+}
+
+// TestRun_InventoryAll verifies "ccmc inventory" prints "Global scope" and at
+// least one entry from each category.
+func TestRun_InventoryAll(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+	buildInventoryFixture(t, tmp)
+
+	out, errOut, code := runCmd([]string{"inventory"})
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
+	}
+	for _, want := range []string{
+		"Global scope",
+		"fixture-mcp",
+		"test-skill",
+		"greet",
+		"helper",
+		"my-plugin",
+		"PostToolUse",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in output; stdout:\n%s", want, out)
+		}
+	}
+}
+
+// TestRun_InventoryMCPsOnly verifies "ccmc inventory mcps" prints the MCP entry
+// and does not print entries from other categories.
+func TestRun_InventoryMCPsOnly(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+	buildInventoryFixture(t, tmp)
+
+	out, errOut, code := runCmd([]string{"inventory", "mcps"})
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
+	}
+	if !strings.Contains(out, "fixture-mcp") {
+		t.Errorf("expected 'fixture-mcp' in output; got:\n%s", out)
+	}
+	// Other categories must not appear.
+	for _, absent := range []string{"test-skill", "greet", "helper", "my-plugin", "PostToolUse"} {
+		if strings.Contains(out, absent) {
+			t.Errorf("unexpected %q in mcps-only output; got:\n%s", absent, out)
+		}
+	}
+}
+
+// TestRun_InventoryHooks verifies "ccmc inventory hooks" lists hook event names
+// from settings.json.
+func TestRun_InventoryHooks(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+	buildInventoryFixture(t, tmp)
+
+	out, errOut, code := runCmd([]string{"inventory", "hooks"})
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
+	}
+	if !strings.Contains(out, "PostToolUse") {
+		t.Errorf("expected 'PostToolUse' in hooks output; got:\n%s", out)
+	}
+	// MCPs must not appear in hooks output.
+	if strings.Contains(out, "fixture-mcp") {
+		t.Errorf("unexpected 'fixture-mcp' in hooks output; got:\n%s", out)
+	}
+}
+
+// TestRun_InventoryEmpty verifies that an empty ~/.claude/ directory exits 0
+// and prints "(no entries)" for every category without any error output.
+func TestRun_InventoryEmpty(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+
+	out, errOut, code := runCmd([]string{"inventory"})
+	if code != 0 {
+		t.Fatalf("expected exit 0 for empty dir, got %d; stderr: %q", code, errOut)
+	}
+	if !strings.Contains(out, "Global scope") {
+		t.Errorf("expected 'Global scope' in output; got:\n%s", out)
+	}
+	if !strings.Contains(out, "(no entries)") {
+		t.Errorf("expected '(no entries)' in output for empty inventory; got:\n%s", out)
+	}
+}
+
+// TestRun_InventoryUnknownSubcommand verifies "ccmc inventory frobs" exits 1
+// with a useful error message on stderr.
+func TestRun_InventoryUnknownSubcommand(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+
+	_, errOut, code := runCmd([]string{"inventory", "frobs"})
+	if code != 1 {
+		t.Fatalf("expected exit 1, got %d; stderr: %q", code, errOut)
+	}
+	if !strings.Contains(errOut, "frobs") {
+		t.Errorf("expected subcommand name in error message; got: %q", errOut)
+	}
+}

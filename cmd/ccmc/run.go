@@ -93,8 +93,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "launch":
 		return runLaunch(rest, stdout, stderr)
 	case "inventory":
-		fmt.Fprintln(stderr, "ccmc inventory: not yet implemented")
-		return 2
+		return runInventory(rest, stdout, stderr)
 	case "eval":
 		fmt.Fprintln(stderr, "ccmc eval: not yet implemented")
 		return 2
