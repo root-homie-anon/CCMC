@@ -1,0 +1,853 @@
+package integrator
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"ccmc/internal/config"
+	"ccmc/pkg/ccmc"
+)
+
+// Sentinel errors returned by Installer.Install.
+var (
+	// ErrUnknownToolType is returned when none of the detection heuristics match
+	// the repo's content. The message includes the evidence examined.
+	ErrUnknownToolType = errors.New("installer: cannot determine tool type")
+
+	// ErrCloneFailed is returned when the git clone step fails.
+	ErrCloneFailed = errors.New("installer: git clone failed")
+
+	// ErrConfigWriteFailed is returned when writing to settings.json fails.
+	ErrConfigWriteFailed = errors.New("installer: config write failed")
+
+	// ErrToolAlreadyInstalled is returned when the registry already contains an
+	// entry for the same SourceURL+Scope combination and Force is false.
+	ErrToolAlreadyInstalled = errors.New("installer: tool already installed")
+)
+
+// cloneCmd is a package-level seam that tests replace to avoid real git invocations.
+var cloneCmd = func(ctx context.Context, url, dest string) error {
+	cmd := exec.CommandContext(ctx, "git", "clone", "--depth=1", url, dest)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// npmInstallCmd is a package-level seam for npm install.
+var npmInstallCmd = func(ctx context.Context, dir string) error {
+	cmd := exec.CommandContext(ctx, "npm", "install")
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// pipInstallCmd is a package-level seam for pip install -e .
+var pipInstallCmd = func(ctx context.Context, dir string) error {
+	cmd := exec.CommandContext(ctx, "pip", "install", "-e", ".")
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// uvSyncCmd is a package-level seam for uv sync.
+var uvSyncCmd = func(ctx context.Context, dir string) error {
+	cmd := exec.CommandContext(ctx, "uv", "sync")
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// InstallSource describes what to install and where.
+type InstallSource struct {
+	URL      string             // GitHub URL (required)
+	EvalCtx  ccmc.EvalContext   // Optional — if already fetched, avoids a second GitHub round-trip
+	EvalRes  ccmc.EvalResult    // Optional — if already evaluated
+	Scope    string             // "global" or absolute project path; default "" = "global"
+	ToolType string             // Optional override; auto-detect when empty
+	Force    bool               // If true, skip duplicate-install check
+}
+
+// Installer clones, copies, and configures Claude Code tools from GitHub repos.
+// Construct with NewInstaller.
+type Installer struct {
+	cfg         config.Config
+	registryPath string
+}
+
+// NewInstaller constructs an Installer using the provided config for model, clone
+// directory, and other settings.
+func NewInstaller(cfg config.Config) *Installer {
+	registryPath := expandTilde("~/.ccmc/tools.json")
+	return &Installer{
+		cfg:          cfg,
+		registryPath: registryPath,
+	}
+}
+
+// Install fetches, detects, installs, and registers the tool described by src.
+// It returns an InstallResult describing what was done and where.
+func (i *Installer) Install(ctx context.Context, src InstallSource) (ccmc.InstallResult, error) {
+	// Normalise scope: empty string means global.
+	if src.Scope == "" {
+		src.Scope = "global"
+	}
+
+	// Resolve tool name from the URL (repo basename).
+	toolName := toolNameFromURL(src.URL)
+
+	// ── Duplicate check ───────────────────────────────────────────────────────
+	if !src.Force {
+		if already, err := i.isRegistered(src.URL, src.Scope); err != nil {
+			return ccmc.InstallResult{}, fmt.Errorf("installer: registry check: %w", err)
+		} else if already {
+			return ccmc.InstallResult{}, fmt.Errorf("%w: %s at scope %s", ErrToolAlreadyInstalled, src.URL, src.Scope)
+		}
+	}
+
+	// ── Type detection ────────────────────────────────────────────────────────
+	toolType := src.ToolType
+	if toolType == "" {
+		detected, evidence, err := detectToolType(src.EvalCtx)
+		if err != nil {
+			return ccmc.InstallResult{}, fmt.Errorf("%w: %s", ErrUnknownToolType, evidence)
+		}
+		toolType = detected
+	}
+
+	// ── Route to type-specific installer ─────────────────────────────────────
+	var result ccmc.InstallResult
+	var installErr error
+
+	switch toolType {
+	case "mcp-stdio":
+		result, installErr = i.installMCPStdio(ctx, src, toolName)
+	case "mcp-sse":
+		result, installErr = i.installMCPSSE(src, toolName)
+	case "skill":
+		result, installErr = i.installSkill(src, toolName)
+	case "agent":
+		result, installErr = i.installAgent(src, toolName)
+	case "plugin":
+		result, installErr = i.installPlugin(ctx, src, toolName)
+	default:
+		return ccmc.InstallResult{}, fmt.Errorf("%w: unrecognised type %q", ErrUnknownToolType, toolType)
+	}
+
+	if installErr != nil {
+		return ccmc.InstallResult{}, installErr
+	}
+
+	// ── Append to tools registry ──────────────────────────────────────────────
+	entry := ccmc.ToolRegistryEntry{
+		Name:        toolName,
+		Type:        toolType,
+		SourceURL:   src.URL,
+		Scope:       src.Scope,
+		InstalledAt: time.Now().UTC().Format(time.RFC3339),
+		ClonePath:   result.ClonePath,
+	}
+	if err := i.appendRegistry(entry); err != nil {
+		// Non-fatal: the tool is installed but the registry couldn't be updated.
+		// Log to stderr so the user is aware; do not fail the install.
+		fmt.Fprintf(os.Stderr, "installer: registry append failed: %v\n", err)
+	}
+
+	return result, nil
+}
+
+// ── Type detection ─────────────────────────────────────────────────────────────
+
+// detectToolType inspects the EvalContext fields to determine the tool type.
+//
+// Priority order (first match wins):
+//  1. ExampleSettings has mcpServers entry with "command" field → "mcp-stdio"
+//  2. ExampleSettings has mcpServers entry with "url" field     → "mcp-sse"
+//  3. PackageJSON or PyprojectTOML has "SKILL.md" signal OR
+//     ReadmeMarkdown mentions SKILL.md                         → "skill"
+//     (SKILL.md is detected by scanning the README for the filename pattern)
+//  4. ReadmeMarkdown contains agent frontmatter signals        → "agent"
+//  5. ExampleSettings or README mentions plugin layout         → "plugin"
+//  6. Otherwise → error with evidence summary
+func detectToolType(ec ccmc.EvalContext) (toolType string, evidence string, err error) {
+	// 1 & 2: MCP detection via example settings.json
+	if ec.ExampleSettings != "" {
+		var settings map[string]json.RawMessage
+		if jsonErr := json.Unmarshal([]byte(ec.ExampleSettings), &settings); jsonErr == nil {
+			if raw, ok := settings["mcpServers"]; ok {
+				var servers map[string]map[string]json.RawMessage
+				if jsonErr := json.Unmarshal(raw, &servers); jsonErr == nil {
+					for _, srv := range servers {
+						if _, hasCmd := srv["command"]; hasCmd {
+							return "mcp-stdio", "mcpServers.command field present", nil
+						}
+						if _, hasURL := srv["url"]; hasURL {
+							return "mcp-sse", "mcpServers.url field present", nil
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 3: Skill detection — presence of SKILL.md in README text
+	if containsSkillSignal(ec.ReadmeMarkdown) {
+		return "skill", "SKILL.md mentioned in README", nil
+	}
+
+	// 4: Agent detection — README contains agent frontmatter patterns
+	if containsAgentSignal(ec.ReadmeMarkdown) {
+		return "agent", "agent frontmatter detected in README", nil
+	}
+
+	// 5: Plugin detection — plugin.json or claude plugin install pattern
+	if containsPluginSignal(ec.ReadmeMarkdown) {
+		return "plugin", "plugin layout detected in README", nil
+	}
+
+	// Collect evidence for the error message.
+	var evidenceParts []string
+	if ec.ExampleSettings != "" {
+		evidenceParts = append(evidenceParts, "has example settings.json but no mcpServers")
+	}
+	if ec.PackageJSON != "" {
+		evidenceParts = append(evidenceParts, "has package.json")
+	}
+	if ec.PyprojectTOML != "" {
+		evidenceParts = append(evidenceParts, "has pyproject.toml")
+	}
+	if len(evidenceParts) == 0 {
+		evidenceParts = append(evidenceParts, "no identifying signals found")
+	}
+
+	return "", strings.Join(evidenceParts, "; "), errors.New("no match")
+}
+
+func containsSkillSignal(readme string) bool {
+	lower := strings.ToLower(readme)
+	return strings.Contains(lower, "skill.md") ||
+		strings.Contains(lower, "skills/") ||
+		strings.Contains(lower, "user-invocable") ||
+		strings.Contains(lower, "disable-model-invocation")
+}
+
+func containsAgentSignal(readme string) bool {
+	lower := strings.ToLower(readme)
+	// Agent frontmatter fields are strong signals.
+	return (strings.Contains(lower, "agents/") && strings.Contains(lower, "frontmatter")) ||
+		(strings.Contains(lower, "agents/") && strings.Contains(lower, ".md")) ||
+		strings.Contains(lower, "agent frontmatter") ||
+		(strings.Contains(lower, "description:") && strings.Contains(lower, "agents/"))
+}
+
+func containsPluginSignal(readme string) bool {
+	lower := strings.ToLower(readme)
+	return strings.Contains(lower, "plugin.json") ||
+		strings.Contains(lower, "claude plugin install") ||
+		strings.Contains(lower, "plugins/")
+}
+
+// ── Type-specific installers ───────────────────────────────────────────────────
+
+func (i *Installer) installMCPStdio(ctx context.Context, src InstallSource, toolName string) (ccmc.InstallResult, error) {
+	// Resolve clone destination.
+	cloneBase := expandTilde(i.cfg.Integrator.CloneDir)
+	cloneDest := filepath.Join(cloneBase, toolName)
+
+	if err := os.MkdirAll(cloneBase, 0o700); err != nil {
+		return ccmc.InstallResult{}, fmt.Errorf("%w: mkdir clone dir: %v", ErrCloneFailed, err)
+	}
+
+	// Clone — idempotent: if the directory already exists, skip the clone.
+	if _, err := os.Stat(cloneDest); os.IsNotExist(err) {
+		if err := cloneCmd(ctx, src.URL, cloneDest); err != nil {
+			return ccmc.InstallResult{}, fmt.Errorf("%w: %v", ErrCloneFailed, err)
+		}
+	}
+
+	// Install dependencies.
+	if err := installDeps(ctx, cloneDest); err != nil {
+		// Warn but continue — some repos self-contain and don't need npm/pip.
+		fmt.Fprintf(os.Stderr, "installer: dep install warning: %v\n", err)
+	}
+
+	// Resolve the MCP entry command from the example settings if available.
+	mcpEntry, warn := resolveMCPStdioEntry(toolName, cloneDest, src.EvalCtx.ExampleSettings)
+	if warn != "" {
+		fmt.Fprintf(os.Stderr, "installer: %s\n", warn)
+	}
+
+	// Write to the target scope settings.json.
+	settingsPath := resolveSettingsPath(src.Scope)
+	if err := mergeMCPServer(settingsPath, toolName, mcpEntry); err != nil {
+		return ccmc.InstallResult{}, fmt.Errorf("%w: %v", ErrConfigWriteFailed, err)
+	}
+
+	return ccmc.InstallResult{
+		Name:       toolName,
+		Type:       "mcp-stdio",
+		SourceURL:  src.URL,
+		Scope:      src.Scope,
+		ClonePath:  cloneDest,
+		ConfigPath: settingsPath,
+	}, nil
+}
+
+func (i *Installer) installMCPSSE(src InstallSource, toolName string) (ccmc.InstallResult, error) {
+	// SSE MCPs are URL-only — no clone, no dep install.
+	sseURL := extractSSEURL(src.EvalCtx.ExampleSettings, src.URL)
+
+	entry := map[string]json.RawMessage{
+		"url": mustMarshal(sseURL),
+	}
+
+	settingsPath := resolveSettingsPath(src.Scope)
+	if err := mergeMCPServer(settingsPath, toolName, entry); err != nil {
+		return ccmc.InstallResult{}, fmt.Errorf("%w: %v", ErrConfigWriteFailed, err)
+	}
+
+	return ccmc.InstallResult{
+		Name:       toolName,
+		Type:       "mcp-sse",
+		SourceURL:  src.URL,
+		Scope:      src.Scope,
+		ConfigPath: settingsPath,
+	}, nil
+}
+
+func (i *Installer) installSkill(src InstallSource, toolName string) (ccmc.InstallResult, error) {
+	// Resolve source skill dir from the cloned repo or the EvalCtx.
+	// For skills, we expect the tool to have been pre-cloned or the files
+	// accessible. Since we don't clone for non-MCP types in the install flow,
+	// we clone into a temp dir and copy.
+	cloneBase := expandTilde(i.cfg.Integrator.CloneDir)
+	cloneDest := filepath.Join(cloneBase, toolName)
+
+	if _, err := os.Stat(cloneDest); os.IsNotExist(err) {
+		if err := os.MkdirAll(cloneBase, 0o700); err != nil {
+			return ccmc.InstallResult{}, fmt.Errorf("%w: mkdir: %v", ErrCloneFailed, err)
+		}
+		// Clone to get the files.
+		ctx := context.Background()
+		if err := cloneCmd(ctx, src.URL, cloneDest); err != nil {
+			return ccmc.InstallResult{}, fmt.Errorf("%w: %v", ErrCloneFailed, err)
+		}
+	}
+
+	// Determine target directory based on scope.
+	targetBase := resolveSkillDir(src.Scope, toolName)
+	if err := os.MkdirAll(targetBase, 0o700); err != nil {
+		return ccmc.InstallResult{}, fmt.Errorf("%w: mkdir target: %v", ErrConfigWriteFailed, err)
+	}
+
+	// Copy the skill dir contents (or the whole repo if no specific skills/ subdir).
+	srcDir := findSkillDir(cloneDest, toolName)
+	if err := copyDir(srcDir, targetBase); err != nil {
+		return ccmc.InstallResult{}, fmt.Errorf("%w: copy skill: %v", ErrConfigWriteFailed, err)
+	}
+
+	return ccmc.InstallResult{
+		Name:       toolName,
+		Type:       "skill",
+		SourceURL:  src.URL,
+		Scope:      src.Scope,
+		ClonePath:  cloneDest,
+		ConfigPath: targetBase,
+	}, nil
+}
+
+func (i *Installer) installAgent(src InstallSource, toolName string) (ccmc.InstallResult, error) {
+	cloneBase := expandTilde(i.cfg.Integrator.CloneDir)
+	cloneDest := filepath.Join(cloneBase, toolName)
+
+	if _, err := os.Stat(cloneDest); os.IsNotExist(err) {
+		if err := os.MkdirAll(cloneBase, 0o700); err != nil {
+			return ccmc.InstallResult{}, fmt.Errorf("%w: mkdir: %v", ErrCloneFailed, err)
+		}
+		ctx := context.Background()
+		if err := cloneCmd(ctx, src.URL, cloneDest); err != nil {
+			return ccmc.InstallResult{}, fmt.Errorf("%w: %v", ErrCloneFailed, err)
+		}
+	}
+
+	// Find the agent markdown file in the cloned repo.
+	agentFile := findAgentFile(cloneDest, toolName)
+	if agentFile == "" {
+		return ccmc.InstallResult{}, fmt.Errorf("%w: no agent .md file found in repo", ErrConfigWriteFailed)
+	}
+
+	// Determine the target agents directory.
+	agentDir := resolveAgentDir(src.Scope)
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		return ccmc.InstallResult{}, fmt.Errorf("%w: mkdir agents dir: %v", ErrConfigWriteFailed, err)
+	}
+
+	destFile := filepath.Join(agentDir, filepath.Base(agentFile))
+	if err := copyFile(agentFile, destFile); err != nil {
+		return ccmc.InstallResult{}, fmt.Errorf("%w: copy agent: %v", ErrConfigWriteFailed, err)
+	}
+
+	return ccmc.InstallResult{
+		Name:       toolName,
+		Type:       "agent",
+		SourceURL:  src.URL,
+		Scope:      src.Scope,
+		ClonePath:  cloneDest,
+		ConfigPath: destFile,
+	}, nil
+}
+
+func (i *Installer) installPlugin(ctx context.Context, src InstallSource, toolName string) (ccmc.InstallResult, error) {
+	// Prefer claude plugin install if the binary is on PATH.
+	if claudePath, err := exec.LookPath("claude"); err == nil {
+		cmd := exec.CommandContext(ctx, claudePath, "plugin", "install", src.URL)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			// Fall through to manual copy.
+			fmt.Fprintf(os.Stderr, "installer: claude plugin install failed: %v — falling back to manual copy\n", err)
+		} else {
+			return ccmc.InstallResult{
+				Name:      toolName,
+				Type:      "plugin",
+				SourceURL: src.URL,
+				Scope:     src.Scope,
+			}, nil
+		}
+	}
+
+	// Manual copy fallback: clone and copy to plugins dir.
+	cloneBase := expandTilde(i.cfg.Integrator.CloneDir)
+	cloneDest := filepath.Join(cloneBase, toolName)
+
+	if _, err := os.Stat(cloneDest); os.IsNotExist(err) {
+		if err := os.MkdirAll(cloneBase, 0o700); err != nil {
+			return ccmc.InstallResult{}, fmt.Errorf("%w: mkdir: %v", ErrCloneFailed, err)
+		}
+		if err := cloneCmd(ctx, src.URL, cloneDest); err != nil {
+			return ccmc.InstallResult{}, fmt.Errorf("%w: %v", ErrCloneFailed, err)
+		}
+	}
+
+	pluginsDir := resolvePluginDir(src.Scope, toolName)
+	if err := os.MkdirAll(filepath.Dir(pluginsDir), 0o700); err != nil {
+		return ccmc.InstallResult{}, fmt.Errorf("%w: mkdir plugins dir: %v", ErrConfigWriteFailed, err)
+	}
+	if err := copyDir(cloneDest, pluginsDir); err != nil {
+		return ccmc.InstallResult{}, fmt.Errorf("%w: copy plugin: %v", ErrConfigWriteFailed, err)
+	}
+
+	return ccmc.InstallResult{
+		Name:       toolName,
+		Type:       "plugin",
+		SourceURL:  src.URL,
+		Scope:      src.Scope,
+		ClonePath:  cloneDest,
+		ConfigPath: pluginsDir,
+	}, nil
+}
+
+// ── Registry helpers ───────────────────────────────────────────────────────────
+
+// isRegistered returns true if tools.json already contains an entry with the
+// same SourceURL and Scope.
+func (i *Installer) isRegistered(sourceURL, scope string) (bool, error) {
+	entries, err := i.loadRegistry()
+	if err != nil {
+		return false, err
+	}
+	for _, e := range entries {
+		if e.SourceURL == sourceURL && e.Scope == scope {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// loadRegistry reads ~/.ccmc/tools.json and returns the entries. Returns an
+// empty slice (not an error) when the file does not exist.
+func (i *Installer) loadRegistry() ([]ccmc.ToolRegistryEntry, error) {
+	b, err := os.ReadFile(i.registryPath)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load registry: %w", err)
+	}
+	var entries []ccmc.ToolRegistryEntry
+	if err := json.Unmarshal(b, &entries); err != nil {
+		return nil, fmt.Errorf("load registry: parse: %w", err)
+	}
+	return entries, nil
+}
+
+// appendRegistry adds one entry to ~/.ccmc/tools.json, creating the file if
+// it does not exist.
+func (i *Installer) appendRegistry(entry ccmc.ToolRegistryEntry) error {
+	if err := os.MkdirAll(filepath.Dir(i.registryPath), 0o700); err != nil {
+		return fmt.Errorf("appendRegistry: mkdir: %w", err)
+	}
+
+	entries, err := i.loadRegistry()
+	if err != nil {
+		return err
+	}
+	entries = append(entries, entry)
+
+	b, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return fmt.Errorf("appendRegistry: marshal: %w", err)
+	}
+	b = append(b, '\n')
+
+	// Atomic write via temp file.
+	dir := filepath.Dir(i.registryPath)
+	f, err := os.CreateTemp(dir, ".ccmc-registry-*")
+	if err != nil {
+		return fmt.Errorf("appendRegistry: create temp: %w", err)
+	}
+	tmpPath := f.Name()
+	if err := os.Chmod(tmpPath, 0o600); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("appendRegistry: chmod: %w", err)
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("appendRegistry: write: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("appendRegistry: sync: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("appendRegistry: close: %w", err)
+	}
+	if err := os.Rename(tmpPath, i.registryPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("appendRegistry: rename: %w", err)
+	}
+	return nil
+}
+
+// ── Path resolution helpers ───────────────────────────────────────────────────
+
+// resolveSettingsPath returns the absolute path to settings.json for the given scope.
+// scope == "global" uses ~/.claude/settings.json; otherwise scope is the absolute
+// project path and we use <scope>/.claude/settings.json.
+func resolveSettingsPath(scope string) string {
+	if scope == "" || scope == "global" {
+		return config.ClaudeSettingsPath()
+	}
+	return filepath.Join(scope, ".claude", "settings.json")
+}
+
+// resolveSkillDir returns the target directory for a skill installation.
+func resolveSkillDir(scope, toolName string) string {
+	if scope == "" || scope == "global" {
+		return expandTilde(filepath.Join("~/.claude/skills", toolName))
+	}
+	return filepath.Join(scope, ".claude", "skills", toolName)
+}
+
+// resolveAgentDir returns the target directory for agent markdown files.
+func resolveAgentDir(scope string) string {
+	if scope == "" || scope == "global" {
+		return expandTilde("~/.claude/agents")
+	}
+	return filepath.Join(scope, ".claude", "agents")
+}
+
+// resolvePluginDir returns the target directory for a manually-copied plugin.
+func resolvePluginDir(scope, toolName string) string {
+	if scope == "" || scope == "global" {
+		return expandTilde(filepath.Join("~/.claude/plugins", toolName))
+	}
+	return filepath.Join(scope, ".claude", "plugins", toolName)
+}
+
+// ── settings.json merge helpers ───────────────────────────────────────────────
+
+// mergeMCPServer reads the current settings.json, merges a new mcpServers entry,
+// and writes back via config.WriteSettings (which handles .bak, symlink guard,
+// atomic write — the same safety guarantees used by the hooks installer).
+func mergeMCPServer(settingsPath, serverName string, entry map[string]json.RawMessage) error {
+	// Ensure parent directory exists.
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o700); err != nil {
+		return fmt.Errorf("mergeMCPServer: mkdir: %w", err)
+	}
+
+	root, err := config.ReadSettings(settingsPath)
+	if err != nil {
+		return fmt.Errorf("mergeMCPServer: read: %w", err)
+	}
+
+	// Decode the existing mcpServers block (or start fresh).
+	var mcpServers map[string]map[string]json.RawMessage
+	if raw, ok := root["mcpServers"]; ok {
+		if jsonErr := json.Unmarshal(raw, &mcpServers); jsonErr != nil {
+			return fmt.Errorf("mergeMCPServer: parse mcpServers: %w", jsonErr)
+		}
+	}
+	if mcpServers == nil {
+		mcpServers = make(map[string]map[string]json.RawMessage)
+	}
+
+	// Merge-not-overwrite: only add if not already present.
+	if _, exists := mcpServers[serverName]; !exists {
+		mcpServers[serverName] = entry
+	}
+
+	mcpRaw, err := json.Marshal(mcpServers)
+	if err != nil {
+		return fmt.Errorf("mergeMCPServer: encode: %w", err)
+	}
+	root["mcpServers"] = json.RawMessage(mcpRaw)
+
+	return config.WriteSettings(settingsPath, root)
+}
+
+// resolveMCPStdioEntry tries to extract the command and args from the repo's
+// example settings.json. Falls back to a sensible default using the cloned repo
+// path and warns the caller when it cannot parse the example.
+func resolveMCPStdioEntry(toolName, cloneDest, exampleSettings string) (map[string]json.RawMessage, string) {
+	if exampleSettings != "" {
+		var settings map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(exampleSettings), &settings); err == nil {
+			if raw, ok := settings["mcpServers"]; ok {
+				var servers map[string]json.RawMessage
+				if err := json.Unmarshal(raw, &servers); err == nil {
+					for _, srvRaw := range servers {
+						var srv map[string]json.RawMessage
+						if err := json.Unmarshal(srvRaw, &srv); err == nil {
+							if _, hasCmd := srv["command"]; hasCmd {
+								// Return the entry as-is from the example.
+								return srv, ""
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Fallback: node index.js or python -m <toolName> depending on what we find.
+	var cmd string
+	var args []json.RawMessage
+
+	if _, err := os.Stat(filepath.Join(cloneDest, "package.json")); err == nil {
+		cmd = "node"
+		indexCandidates := []string{"index.js", "src/index.js", "dist/index.js", "build/index.js"}
+		entrypoint := "index.js"
+		for _, c := range indexCandidates {
+			if _, err := os.Stat(filepath.Join(cloneDest, c)); err == nil {
+				entrypoint = c
+				break
+			}
+		}
+		args = []json.RawMessage{mustMarshal(filepath.Join(cloneDest, entrypoint))}
+	} else if _, err := os.Stat(filepath.Join(cloneDest, "pyproject.toml")); err == nil {
+		cmd = "python"
+		args = []json.RawMessage{mustMarshal("-m"), mustMarshal(toolName)}
+	} else {
+		cmd = filepath.Join(cloneDest, toolName)
+	}
+
+	entry := map[string]json.RawMessage{
+		"command": mustMarshal(cmd),
+	}
+	if len(args) > 0 {
+		argsJSON, _ := json.Marshal(args)
+		entry["args"] = argsJSON
+	}
+
+	warn := fmt.Sprintf("could not parse command from example settings.json for %s — using default: %s; verify mcpServers entry is correct", toolName, cmd)
+	return entry, warn
+}
+
+// extractSSEURL attempts to get the SSE URL from the example settings.json.
+// Falls back to the source URL if not found.
+func extractSSEURL(exampleSettings, fallbackURL string) string {
+	if exampleSettings != "" {
+		var settings map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(exampleSettings), &settings); err == nil {
+			if raw, ok := settings["mcpServers"]; ok {
+				var servers map[string]json.RawMessage
+				if err := json.Unmarshal(raw, &servers); err == nil {
+					for _, srvRaw := range servers {
+						var srv map[string]string
+						if err := json.Unmarshal(srvRaw, &srv); err == nil {
+							if u, ok := srv["url"]; ok && u != "" {
+								return u
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return fallbackURL
+}
+
+// ── Dep install ────────────────────────────────────────────────────────────────
+
+// installDeps runs the appropriate package manager in dir based on what manifest
+// files are present. Tries npm first (package.json), then pyproject.toml (uv
+// sync preferred, pip install -e . fallback).
+func installDeps(ctx context.Context, dir string) error {
+	if _, err := os.Stat(filepath.Join(dir, "package.json")); err == nil {
+		return npmInstallCmd(ctx, dir)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "pyproject.toml")); err == nil {
+		// Try uv first; if not on PATH, fall back to pip.
+		if _, err := exec.LookPath("uv"); err == nil {
+			return uvSyncCmd(ctx, dir)
+		}
+		return pipInstallCmd(ctx, dir)
+	}
+	return nil // no manifest found; nothing to install
+}
+
+// ── Filesystem helpers ─────────────────────────────────────────────────────────
+
+// findSkillDir returns the best candidate source directory for a skill installation.
+// Checks for skills/<toolName>/ then skills/ then falls back to the repo root.
+func findSkillDir(cloneDest, toolName string) string {
+	candidates := []string{
+		filepath.Join(cloneDest, "skills", toolName),
+		filepath.Join(cloneDest, "skills"),
+		cloneDest,
+	}
+	for _, c := range candidates {
+		if fi, err := os.Stat(c); err == nil && fi.IsDir() {
+			return c
+		}
+	}
+	return cloneDest
+}
+
+// findAgentFile returns the first *.md file under agents/ in cloneDest, or a
+// root *.md whose frontmatter indicates it is an agent, or empty string.
+func findAgentFile(cloneDest, toolName string) string {
+	// Check agents/ subdir first.
+	agentsDir := filepath.Join(cloneDest, "agents")
+	if _, err := os.Stat(agentsDir); err == nil {
+		pattern := filepath.Join(agentsDir, "*.md")
+		if matches, err := filepath.Glob(pattern); err == nil && len(matches) > 0 {
+			return matches[0]
+		}
+	}
+
+	// Fall back to root *.md files.
+	pattern := filepath.Join(cloneDest, "*.md")
+	if matches, err := filepath.Glob(pattern); err == nil {
+		for _, m := range matches {
+			base := strings.ToLower(filepath.Base(m))
+			// Skip README.
+			if base == "readme.md" || base == "readme" {
+				continue
+			}
+			return m
+		}
+	}
+
+	// Try <toolName>.md at root.
+	candidate := filepath.Join(cloneDest, toolName+".md")
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate
+	}
+
+	return ""
+}
+
+// copyDir recursively copies src directory contents into dst. dst is created
+// if it does not exist.
+func copyDir(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o700)
+		}
+		return copyFile(path, target)
+	})
+}
+
+// copyFile copies a single file from src to dst, creating the destination
+// directory if needed.
+func copyFile(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, in)
+	return err
+}
+
+// toolNameFromURL extracts the repo name from a GitHub URL.
+// "https://github.com/owner/my-tool" → "my-tool"
+func toolNameFromURL(rawURL string) string {
+	_, repo, err := ParseURL(rawURL)
+	if err != nil || repo == "" {
+		// Fallback: use the last path segment.
+		parts := strings.Split(strings.TrimRight(rawURL, "/"), "/")
+		if len(parts) > 0 {
+			return strings.TrimSuffix(parts[len(parts)-1], ".git")
+		}
+		return "unknown-tool"
+	}
+	return repo
+}
+
+// expandTilde replaces a leading "~/" with the user's home directory.
+func expandTilde(path string) string {
+	if !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	return filepath.Join(home, path[2:])
+}
+
+// mustMarshal JSON-encodes v and panics on error. Only used for literals where
+// encode failure is impossible (string, slice of strings, etc.).
+func mustMarshal(v any) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(fmt.Sprintf("mustMarshal: %v", err))
+	}
+	return json.RawMessage(b)
+}

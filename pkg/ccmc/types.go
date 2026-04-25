@@ -204,6 +204,27 @@ type PluginEntry struct {
 	MCPs   []string // MCP server names extracted from settings.json mcpServers block
 }
 
+// InstallResult is the structured output from the tool installer.
+type InstallResult struct {
+	Name      string `json:"name"`      // Resolved tool name (repo basename or frontmatter)
+	Type      string `json:"type"`      // "mcp-stdio" | "mcp-sse" | "skill" | "agent" | "plugin"
+	SourceURL string `json:"sourceUrl"` // Original GitHub URL passed by the caller
+	Scope     string `json:"scope"`     // "global" or absolute project path
+	ClonePath string `json:"clonePath"` // Absolute path to cloned repo; empty for non-clone types
+	ConfigPath string `json:"configPath"` // Absolute path to the settings.json that was written
+}
+
+// ToolRegistryEntry is one row in ~/.ccmc/tools.json written by the installer.
+// The manager (task 56) reads this file to implement ccmc tools ls/rm/update.
+type ToolRegistryEntry struct {
+	Name        string `json:"name"`
+	Type        string `json:"type"`
+	SourceURL   string `json:"sourceUrl"`
+	Scope       string `json:"scope"`
+	InstalledAt string `json:"installedAt"` // RFC3339
+	ClonePath   string `json:"clonePath,omitempty"`
+}
+
 // DaemonStatus is the daemon health and registry summary returned by GET /status.
 type DaemonStatus struct {
 	Running       bool      `json:"running"`
