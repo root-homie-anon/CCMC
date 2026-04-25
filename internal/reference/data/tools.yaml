@@ -1,0 +1,290 @@
+- name: Read
+  category: tools
+  description: Reads the contents of a file from the filesystem, returning its text with line numbers.
+  usage: Read(file_path, [offset], [limit])
+  examples:
+    - "Read: { file_path: \"/path/to/file.go\" }"
+    - "Read: { file_path: \"/path/to/large.go\", offset: 100, limit: 50 }"
+  related:
+    - Write
+    - Glob
+    - Grep
+  gotchas:
+    - "Use in permission rules as the tool_name value: \"Read\"."
+    - "Use in hook matchers: { tool_name: \"Read\" }."
+
+- name: Write
+  category: tools
+  description: Writes content to a file, creating it if it does not exist or overwriting it entirely.
+  usage: Write(file_path, content)
+  examples:
+    - "Write: { file_path: \"/path/to/file.go\", content: \"...\" }"
+  related:
+    - Edit
+    - MultiEdit
+    - Read
+  gotchas:
+    - "Overwrites the entire file — use Edit for partial changes to avoid destroying existing content."
+    - "Triggers the FileChanged hook with change_type: created or modified."
+
+- name: Edit
+  category: tools
+  description: Performs an exact string replacement within a file, replacing old_string with new_string.
+  usage: Edit(file_path, old_string, new_string)
+  examples:
+    - "Edit: { file_path: \"/path/to/file.go\", old_string: \"foo\", new_string: \"bar\" }"
+  related:
+    - MultiEdit
+    - Write
+    - Read
+  gotchas:
+    - "old_string must be unique in the file — non-unique matches cause the edit to fail."
+    - "Triggers the FileChanged hook with change_type: modified."
+
+- name: MultiEdit
+  category: tools
+  description: Applies multiple exact string replacements to a file in a single atomic operation.
+  usage: MultiEdit(file_path, edits)
+  examples:
+    - "MultiEdit: { file_path: \"/path/to/file.go\", edits: [ { old_string: \"a\", new_string: \"b\" } ] }"
+  related:
+    - Edit
+    - Write
+  gotchas:
+    - "Each edit's old_string must be unique in the file at the time it is applied."
+    - "Emits one FileChanged event per affected file, not per edit."
+
+- name: Bash
+  category: tools
+  description: Executes a shell command in the session's working directory and returns stdout, stderr, and exit code.
+  usage: Bash(command, [timeout])
+  examples:
+    - "Bash: { command: \"go test ./...\" }"
+    - "Bash: { command: \"ls -la\", timeout: 5000 }"
+  related:
+    - Read
+    - Write
+  gotchas:
+    - "Shell state does not persist between Bash calls — each call is a fresh subshell."
+    - "Use in permission allow rules: { \"Bash\": { \"command\": \"go test*\" } }."
+    - "Non-zero exit code causes the tool result to reflect the failure; hooks fire PostToolUseFailure."
+
+- name: Grep
+  category: tools
+  description: Searches file contents for a pattern, returning matching lines with file paths and line numbers.
+  usage: Grep(pattern, [path], [include])
+  examples:
+    - "Grep: { pattern: \"func Load\", path: \"/Users/me/project\" }"
+    - "Grep: { pattern: \"TODO\", include: \"*.go\" }"
+  related:
+    - Glob
+    - Read
+  gotchas:
+    - "Pattern is a regular expression — escape special chars when searching literal strings."
+
+- name: Glob
+  category: tools
+  description: Lists files matching a glob pattern, returning their paths.
+  usage: Glob(pattern, [path])
+  examples:
+    - "Glob: { pattern: \"**/*.go\" }"
+    - "Glob: { pattern: \"internal/**/*.yaml\", path: \"/Users/me/project\" }"
+  related:
+    - Grep
+    - Read
+  gotchas:
+    - "Returns paths only, not file contents — follow with Read for content."
+
+- name: Agent
+  category: tools
+  description: Spawns a subagent to execute a task autonomously, returning its result when complete.
+  usage: Agent(task, [agent_name])
+  examples:
+    - "Agent: { task: \"review internal/reference/loader.go for correctness\" }"
+  related:
+    - Task
+    - SendMessage
+  gotchas:
+    - "Fires SubagentStart and SubagentStop hooks around the subagent's lifecycle."
+    - "agent_name, if provided, must match an agent defined in .claude/agents/ or ~/.claude/agents/."
+
+- name: Task
+  category: tools
+  description: Spawns a subagent scoped to a specific task, similar to Agent but with task-list integration for team sessions.
+  usage: Task(task, [agent_name])
+  examples:
+    - "Task: { task: \"populate flags.yaml\", agent_name: \"ref-builder\" }"
+  related:
+    - Agent
+    - TaskCreate
+  gotchas:
+    - "In non-team sessions, behaves like Agent — the task list integration only activates in team mode."
+
+- name: SendMessage
+  category: tools
+  description: Sends a message to a named teammate in an active agent team session.
+  usage: SendMessage(to, message)
+  examples:
+    - "SendMessage: { to: \"doug\", message: \"flags.yaml is ready for review\" }"
+  related:
+    - TeamCreate
+    - Agent
+  gotchas:
+    - "Only available in team sessions created with TeamCreate — errors in non-team contexts."
+    - "Address teammates by name (as set in TeamCreate), never by UUID."
+
+- name: TeamCreate
+  category: tools
+  description: Creates a multi-agent team session with a shared task list, enabling parallel specialist coordination.
+  usage: TeamCreate(name, goal)
+  examples:
+    - "TeamCreate: { name: \"ref-team\", goal: \"populate all reference YAMLs\" }"
+  related:
+    - TeamDelete
+    - SendMessage
+  gotchas:
+    - "Team sessions are expensive — each teammate runs an independent context window."
+    - "Requires CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 environment variable."
+
+- name: TeamDelete
+  category: tools
+  description: Deletes an active agent team session after all teammates have been shut down.
+  usage: TeamDelete(team_name)
+  examples:
+    - "TeamDelete: { team_name: \"ref-team\" }"
+  related:
+    - TeamCreate
+    - SendMessage
+  gotchas:
+    - "Will fail if any teammate is still active — send shutdown_request to each teammate first."
+
+- name: TaskCreate
+  category: tools
+  description: Creates a task in the team's shared task list and optionally assigns it to a teammate.
+  usage: TaskCreate(title, description, [assignee])
+  examples:
+    - "TaskCreate: { title: \"populate skills.yaml\", description: \"...\", assignee: \"doug\" }"
+  related:
+    - TaskUpdate
+    - TaskList
+    - Task
+  gotchas:
+    - "Only available in team sessions — errors outside of TeamCreate context."
+
+- name: TaskUpdate
+  category: tools
+  description: Updates the status or fields of an existing task in the team's shared task list.
+  usage: TaskUpdate(task_id, fields)
+  examples:
+    - "TaskUpdate: { task_id: \"t1\", fields: { status: \"done\" } }"
+  related:
+    - TaskCreate
+    - TaskGet
+  gotchas:
+    - "task_id must match an existing task created with TaskCreate."
+
+- name: TaskGet
+  category: tools
+  description: Retrieves the details of a specific task from the team's shared task list by ID.
+  usage: TaskGet(task_id)
+  examples:
+    - "TaskGet: { task_id: \"t1\" }"
+  related:
+    - TaskList
+    - TaskUpdate
+  gotchas:
+    - "Returns full task detail including assignee, status, and description."
+
+- name: TaskList
+  category: tools
+  description: Lists all tasks in the team's shared task list, optionally filtered by status or assignee.
+  usage: TaskList([filter])
+  examples:
+    - "TaskList: {}"
+    - "TaskList: { filter: { status: \"pending\" } }"
+  related:
+    - TaskCreate
+    - TaskGet
+  gotchas:
+    - "Returns tasks for the current team session only."
+
+- name: WebFetch
+  category: tools
+  description: Fetches the content of a URL, returning the response body as text.
+  usage: WebFetch(url, [prompt])
+  examples:
+    - "WebFetch: { url: \"https://example.com/api/data\" }"
+  related:
+    - WebSearch
+  gotchas:
+    - "HTML is converted to markdown for readability; raw HTML is not returned."
+    - "Requires outbound network access — unavailable in air-gapped environments."
+
+- name: WebSearch
+  category: tools
+  description: Performs a web search and returns a list of results with titles, URLs, and snippets.
+  usage: WebSearch(query)
+  examples:
+    - "WebSearch: { query: \"go yaml.v3 unmarshal slice\" }"
+  related:
+    - WebFetch
+  gotchas:
+    - "Results are snippets, not full page content — follow with WebFetch to read a specific result."
+
+- name: Monitor
+  category: tools
+  description: Streams stdout from a background process started by Bash, notifying when each line appears.
+  usage: Monitor(process_id)
+  examples:
+    - "Monitor: { process_id: \"<id from background Bash call>\" }"
+  related:
+    - Bash
+  gotchas:
+    - "Used with Bash's run_in_background option — only monitors processes started that way."
+
+- name: Skill
+  category: tools
+  description: Invokes a named skill within the current session, loading its SKILL.md and executing its instructions.
+  usage: Skill(skill)
+  examples:
+    - "Skill: { skill: \"simplify\" }"
+    - "Skill: { skill: \"claude-api\" }"
+  related:
+    - Agent
+  gotchas:
+    - "Skill name must match a file in ~/.claude/skills/ or .claude/skills/ (without the extension)."
+    - "Model-invocable skills can be triggered automatically — user-invocable ones require explicit invocation."
+
+- name: ExitPlanMode
+  category: tools
+  description: Exits plan mode and transitions to execution mode, proceeding with the approved plan.
+  usage: ExitPlanMode()
+  examples:
+    - "ExitPlanMode: {}"
+  related:
+    - Skill
+  gotchas:
+    - "Only available when a plan mode session is active."
+
+- name: PowerShell
+  category: tools
+  description: Executes a PowerShell command on Windows environments, analogous to Bash on Unix.
+  usage: PowerShell(command)
+  examples:
+    - "PowerShell: { command: \"Get-ChildItem\" }"
+  related:
+    - Bash
+  gotchas:
+    - "Only available when CLAUDE_CODE_USE_POWERSHELL_TOOL is set — not available on macOS/Linux by default."
+
+- name: LSP
+  category: tools
+  description: Queries the Language Server Protocol integration for semantic code information such as diagnostics, references, and completions.
+  usage: LSP(method, params)
+  examples:
+    - "LSP: { method: \"textDocument/diagnostics\", params: { ... } }"
+  related:
+    - Read
+    - Grep
+  gotchas:
+    - "Requires an active LSP server for the project's language; unavailable without one configured."
