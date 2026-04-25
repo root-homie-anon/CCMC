@@ -107,6 +107,18 @@ type InventoryItem struct {
 	Extra       map[string]any    `json:"extra"`       // Type-specific fields (e.g. MCP transport, agent model)
 }
 
+// MCPEntry is a parsed MCP server entry from a settings.json mcpServers block.
+type MCPEntry struct {
+	Name    string   // map key under mcpServers
+	Scope   string   // "global" or absolute project path (ProjectPath from ScopeFiles)
+	Type    string   // "stdio" if command field present, "sse" if url field present, "unknown" otherwise
+	Command string   // stdio only
+	Args    []string // stdio only; nil when not present
+	URL     string   // sse only
+	Tools   []string // explicitly listed tools in config; nil when absent
+	Status  string   // "configured" for v1 (connected check deferred to daemon)
+}
+
 // EvalResult is the structured output from the tool evaluator (Anthropic API call).
 type EvalResult struct {
 	ToolName       string   `json:"toolName"`
@@ -149,6 +161,47 @@ type EvalContext struct {
 	PackageJSON     string   `json:"packageJson"`     // Raw text if present at root, else ""
 	PyprojectTOML   string   `json:"pyprojectToml"`   // Raw text if present at root, else ""
 	ExampleSettings string   `json:"exampleSettings"` // settings.json at root or examples/, else ""
+}
+
+// SkillEntry is a parsed inventory entry for a Claude Code skill found in a SKILL.md file.
+type SkillEntry struct {
+	Name                   string // from frontmatter "name" or dir basename
+	Path                   string // absolute path to SKILL.md
+	Scope                  string // "global" or absolute project path
+	Description            string // from frontmatter "description"
+	UserInvocable          bool   // from frontmatter "user-invocable"
+	DisableModelInvocation bool   // from frontmatter "disable-model-invocation"
+}
+
+// CommandEntry is a parsed inventory entry for a custom command found in commands/*.md.
+type CommandEntry struct {
+	Name        string // from frontmatter "name" or filename without .md
+	Path        string // absolute path to .md file
+	Scope       string // "global" or absolute project path
+	Description string // from frontmatter "description"
+}
+
+// AgentEntry is a parsed agent definition read from an agents/*.md file.
+type AgentEntry struct {
+	Name        string   // "name" frontmatter field, or filename without .md if absent
+	Path        string   // Absolute path to the .md file
+	Scope       string   // "global" or absolute project path (encoded project dir)
+	Description string   // "description" frontmatter field
+	Model       string   // "model" frontmatter field
+	Tools       []string // "tools" frontmatter field; nil when absent
+}
+
+// PluginEntry is a parsed entry for one installed plugin.
+// A plugin is typically a directory under plugins/ that may contribute skills,
+// agents, hooks, and/or MCP servers to a Claude Code scope.
+type PluginEntry struct {
+	Name   string   // Directory basename (or filename without extension for file-based plugins)
+	Path   string   // Absolute path to the plugin directory or file
+	Scope  string   // "global" or absolute project path
+	Skills []string // Skill names contributed: basenames of skills/* subdirectories
+	Agents []string // Agent names contributed: basenames of agents/*.md without extension
+	Hooks  []string // Hook event names extracted from settings.json hooks block
+	MCPs   []string // MCP server names extracted from settings.json mcpServers block
 }
 
 // DaemonStatus is the daemon health and registry summary returned by GET /status.
