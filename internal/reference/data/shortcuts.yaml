@@ -1,0 +1,155 @@
+- name: Ctrl+C
+  category: shortcuts
+  description: Interrupts the current Claude response or tool execution mid-turn.
+  usage: ""
+  examples:
+    - "Ctrl+C"
+  related:
+    - Ctrl+B
+    - Ctrl+F
+  gotchas:
+    - "Interrupts the current turn but does not exit the session; Claude remains ready for the next prompt."
+    - "If background agents are running, they continue — use Ctrl+F to kill them."
+
+- name: Ctrl+O
+  category: shortcuts
+  description: Opens the transcript viewer, showing the full JSONL session history in a scrollable pane.
+  usage: ""
+  examples:
+    - "Ctrl+O"
+  related:
+    - /diff
+    - /status
+  gotchas:
+    - "Shows the raw JSONL transcript; large sessions may be slow to render."
+
+- name: Ctrl+F
+  category: shortcuts
+  description: Kills all background agents spawned in the current session.
+  usage: ""
+  examples:
+    - "Ctrl+F"
+  related:
+    - Ctrl+C
+    - Ctrl+B
+  gotchas:
+    - "Kills all agents running in the background, not just the most recently spawned one."
+    - "Does not interrupt the foreground response — use Ctrl+C for that."
+
+- name: Ctrl+B
+  category: shortcuts
+  description: Backgrounds the current running command or agent, returning the prompt while the task continues.
+  usage: ""
+  examples:
+    - "Ctrl+B"
+  related:
+    - Ctrl+C
+    - Ctrl+F
+  gotchas:
+    - "The backgrounded task continues consuming tokens — use Ctrl+F when you want to stop it entirely."
+
+- name: Ctrl+R
+  category: shortcuts
+  description: Opens the prompt history search, letting you fuzzy-search and recall previous prompts.
+  usage: ""
+  examples:
+    - "Ctrl+R"
+  related:
+    - Shift+Enter
+  gotchas:
+    - "History is scoped to the current session; prior sessions' prompts are not included."
+
+- name: Shift+Enter
+  category: shortcuts
+  description: Inserts a newline in the prompt input without submitting, enabling multi-line prompt composition.
+  usage: ""
+  examples:
+    - "Shift+Enter"
+  related:
+    - Ctrl+R
+  gotchas:
+    - "Behavior may vary by terminal emulator — some terminals intercept Shift+Enter before CC sees it."
+
+- name: Tab
+  category: shortcuts
+  description: Accepts the current inline autocomplete suggestion in the prompt input.
+  usage: ""
+  examples:
+    - "Tab"
+  related:
+    - Right arrow
+  gotchas:
+    - "Tab and Right arrow both accept suggestions; Tab is more reliable across terminals."
+
+- name: Right arrow
+  category: shortcuts
+  description: Accepts the current inline autocomplete suggestion when the cursor is at the end of the input.
+  usage: ""
+  examples:
+    - "Right arrow"
+  related:
+    - Tab
+  gotchas:
+    - "Only accepts the suggestion when the cursor is at the rightmost position; otherwise moves the cursor."
+
+- name: Space (side question dismiss)
+  category: shortcuts
+  description: Dismisses a side question or inline confirmation dialog presented by Claude.
+  usage: ""
+  examples:
+    - "Space"
+  related:
+    - Enter (side question dismiss)
+    - Escape (side question dismiss)
+  gotchas:
+    - "Space, Enter, and Escape all dismiss side questions — Space and Enter confirm, Escape cancels."
+
+- name: Enter (side question dismiss)
+  category: shortcuts
+  description: Confirms and dismisses a side question or inline confirmation dialog.
+  usage: ""
+  examples:
+    - "Enter"
+  related:
+    - Space (side question dismiss)
+    - Escape (side question dismiss)
+  gotchas:
+    - "Enter confirms the default action; Escape cancels without acting."
+
+- name: Escape (side question dismiss)
+  category: shortcuts
+  description: Cancels and dismisses a side question or inline confirmation dialog without taking action.
+  usage: ""
+  examples:
+    - "Escape"
+  related:
+    - Space (side question dismiss)
+    - Enter (side question dismiss)
+  gotchas:
+    - "In the reference overlay, Escape closes the overlay rather than dismissing a side question."
+
+- name: "! prefix"
+  category: shortcuts
+  description: Bash mode prefix — prepend ! to a prompt to run it as a raw shell command rather than a Claude prompt.
+  usage: "!<shell-command>"
+  examples:
+    - "!ls -la"
+    - "!git status"
+  related:
+    - Ctrl+B
+  gotchas:
+    - "The command runs in the session's shell environment, not as a tool call — output is shown inline but not in the tool call trace."
+    - "Shell expansions and pipes work normally."
+
+- name: "@ file mention"
+  category: shortcuts
+  description: Mentions a file inline in the prompt, triggering a file picker and injecting the file path into the prompt.
+  usage: "@<filename-or-path>"
+  examples:
+    - "@main.go"
+    - "@internal/reference/loader.go"
+  related:
+    - /diff
+  gotchas:
+    - "The file is referenced by path — Claude reads it via the Read tool unless the content is already in context."
+    - "Partial paths trigger a fuzzy file picker; exact matches are resolved immediately."
