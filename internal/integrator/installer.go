@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"ccmc/internal/config"
@@ -35,8 +36,14 @@ var (
 )
 
 // cloneCmd is a package-level seam that tests replace to avoid real git invocations.
+// The "--" separator is mandatory: it prevents git from misinterpreting a URL that
+// starts with "--" as a flag (defense-in-depth against flag injection via URL).
 var cloneCmd = func(ctx context.Context, url, dest string) error {
-	cmd := exec.CommandContext(ctx, "git", "clone", "--depth=1", url, dest)
+	// Scheme allowlist: only https://github.com/ is accepted.
+	if !strings.HasPrefix(url, "https://github.com/") {
+		return fmt.Errorf("cloneCmd: URL %q is not an allowed GitHub HTTPS URL", url)
+	}
+	cmd := exec.CommandContext(ctx, "git", "clone", "--depth=1", "--", url, dest)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -131,14 +138,14 @@ func (i *Installer) Install(ctx context.Context, src InstallSource) (ccmc.Instal
 	var installErr error
 
 	switch toolType {
-	case "mcp-stdio":
+	case "stdio":
 		result, installErr = i.installMCPStdio(ctx, src, toolName)
-	case "mcp-sse":
+	case "sse":
 		result, installErr = i.installMCPSSE(src, toolName)
 	case "skill":
-		result, installErr = i.installSkill(src, toolName)
+		result, installErr = i.installSkill(ctx, src, toolName)
 	case "agent":
-		result, installErr = i.installAgent(src, toolName)
+		result, installErr = i.installAgent(ctx, src, toolName)
 	case "plugin":
 		result, installErr = i.installPlugin(ctx, src, toolName)
 	default:
@@ -149,7 +156,7 @@ func (i *Installer) Install(ctx context.Context, src InstallSource) (ccmc.Instal
 		return ccmc.InstallResult{}, installErr
 	}
 
-	// ── Append to tools registry ──────────────────────────────────────────────
+	// ── Append to tools registry via Manager (has lstatGuard + atomic write) ─
 	entry := ccmc.ToolRegistryEntry{
 		Name:        toolName,
 		Type:        toolType,
@@ -158,7 +165,8 @@ func (i *Installer) Install(ctx context.Context, src InstallSource) (ccmc.Instal
 		InstalledAt: time.Now().UTC().Format(time.RFC3339),
 		ClonePath:   result.ClonePath,
 	}
-	if err := i.appendRegistry(entry); err != nil {
+	mgr := NewManager(i.registryPath)
+	if err := mgr.Add(entry); err != nil {
 		// Non-fatal: the tool is installed but the registry couldn't be updated.
 		// Log to stderr so the user is aware; do not fail the install.
 		fmt.Fprintf(os.Stderr, "installer: registry append failed: %v\n", err)
@@ -172,8 +180,8 @@ func (i *Installer) Install(ctx context.Context, src InstallSource) (ccmc.Instal
 // detectToolType inspects the EvalContext fields to determine the tool type.
 //
 // Priority order (first match wins):
-//  1. ExampleSettings has mcpServers entry with "command" field → "mcp-stdio"
-//  2. ExampleSettings has mcpServers entry with "url" field     → "mcp-sse"
+//  1. ExampleSettings has mcpServers entry with "command" field → "stdio"
+//  2. ExampleSettings has mcpServers entry with "url" field     → "sse"
 //  3. PackageJSON or PyprojectTOML has "SKILL.md" signal OR
 //     ReadmeMarkdown mentions SKILL.md                         → "skill"
 //     (SKILL.md is detected by scanning the README for the filename pattern)
@@ -190,10 +198,10 @@ func detectToolType(ec ccmc.EvalContext) (toolType string, evidence string, err 
 				if jsonErr := json.Unmarshal(raw, &servers); jsonErr == nil {
 					for _, srv := range servers {
 						if _, hasCmd := srv["command"]; hasCmd {
-							return "mcp-stdio", "mcpServers.command field present", nil
+							return "stdio", "mcpServers.command field present", nil
 						}
 						if _, hasURL := srv["url"]; hasURL {
-							return "mcp-sse", "mcpServers.url field present", nil
+							return "sse", "mcpServers.url field present", nil
 						}
 					}
 				}
@@ -283,7 +291,10 @@ func (i *Installer) installMCPStdio(ctx context.Context, src InstallSource, tool
 	}
 
 	// Resolve the MCP entry command from the example settings if available.
-	mcpEntry, warn := resolveMCPStdioEntry(toolName, cloneDest, src.EvalCtx.ExampleSettings)
+	mcpEntry, warn, err := resolveMCPStdioEntry(toolName, cloneDest, src.EvalCtx.ExampleSettings)
+	if err != nil {
+		return ccmc.InstallResult{}, fmt.Errorf("%w: %v", ErrConfigWriteFailed, err)
+	}
 	if warn != "" {
 		fmt.Fprintf(os.Stderr, "installer: %s\n", warn)
 	}
@@ -296,7 +307,7 @@ func (i *Installer) installMCPStdio(ctx context.Context, src InstallSource, tool
 
 	return ccmc.InstallResult{
 		Name:       toolName,
-		Type:       "mcp-stdio",
+		Type:       "stdio",
 		SourceURL:  src.URL,
 		Scope:      src.Scope,
 		ClonePath:  cloneDest,
@@ -319,14 +330,14 @@ func (i *Installer) installMCPSSE(src InstallSource, toolName string) (ccmc.Inst
 
 	return ccmc.InstallResult{
 		Name:       toolName,
-		Type:       "mcp-sse",
+		Type:       "sse",
 		SourceURL:  src.URL,
 		Scope:      src.Scope,
 		ConfigPath: settingsPath,
 	}, nil
 }
 
-func (i *Installer) installSkill(src InstallSource, toolName string) (ccmc.InstallResult, error) {
+func (i *Installer) installSkill(ctx context.Context, src InstallSource, toolName string) (ccmc.InstallResult, error) {
 	// Resolve source skill dir from the cloned repo or the EvalCtx.
 	// For skills, we expect the tool to have been pre-cloned or the files
 	// accessible. Since we don't clone for non-MCP types in the install flow,
@@ -338,8 +349,6 @@ func (i *Installer) installSkill(src InstallSource, toolName string) (ccmc.Insta
 		if err := os.MkdirAll(cloneBase, 0o700); err != nil {
 			return ccmc.InstallResult{}, fmt.Errorf("%w: mkdir: %v", ErrCloneFailed, err)
 		}
-		// Clone to get the files.
-		ctx := context.Background()
 		if err := cloneCmd(ctx, src.URL, cloneDest); err != nil {
 			return ccmc.InstallResult{}, fmt.Errorf("%w: %v", ErrCloneFailed, err)
 		}
@@ -367,7 +376,7 @@ func (i *Installer) installSkill(src InstallSource, toolName string) (ccmc.Insta
 	}, nil
 }
 
-func (i *Installer) installAgent(src InstallSource, toolName string) (ccmc.InstallResult, error) {
+func (i *Installer) installAgent(ctx context.Context, src InstallSource, toolName string) (ccmc.InstallResult, error) {
 	cloneBase := expandTilde(i.cfg.Integrator.CloneDir)
 	cloneDest := filepath.Join(cloneBase, toolName)
 
@@ -375,7 +384,6 @@ func (i *Installer) installAgent(src InstallSource, toolName string) (ccmc.Insta
 		if err := os.MkdirAll(cloneBase, 0o700); err != nil {
 			return ccmc.InstallResult{}, fmt.Errorf("%w: mkdir: %v", ErrCloneFailed, err)
 		}
-		ctx := context.Background()
 		if err := cloneCmd(ctx, src.URL, cloneDest); err != nil {
 			return ccmc.InstallResult{}, fmt.Errorf("%w: %v", ErrCloneFailed, err)
 		}
@@ -409,6 +417,11 @@ func (i *Installer) installAgent(src InstallSource, toolName string) (ccmc.Insta
 }
 
 func (i *Installer) installPlugin(ctx context.Context, src InstallSource, toolName string) (ccmc.InstallResult, error) {
+	// H-1: scheme allowlist — only GitHub HTTPS URLs are accepted.
+	if !strings.HasPrefix(src.URL, "https://github.com/") {
+		return ccmc.InstallResult{}, fmt.Errorf("installPlugin: URL %q is not an allowed GitHub HTTPS URL", src.URL)
+	}
+
 	// Prefer claude plugin install if the binary is on PATH.
 	if claudePath, err := exec.LookPath("claude"); err == nil {
 		cmd := exec.CommandContext(ctx, claudePath, "plugin", "install", src.URL)
@@ -461,7 +474,8 @@ func (i *Installer) installPlugin(ctx context.Context, src InstallSource, toolNa
 // ── Registry helpers ───────────────────────────────────────────────────────────
 
 // isRegistered returns true if tools.json already contains an entry with the
-// same SourceURL and Scope.
+// same SourceURL and Scope. Delegates to Manager so both registry readers share
+// the same lstatGuard and format (M-1).
 func (i *Installer) isRegistered(sourceURL, scope string) (bool, error) {
 	entries, err := i.loadRegistry()
 	if err != nil {
@@ -475,74 +489,12 @@ func (i *Installer) isRegistered(sourceURL, scope string) (bool, error) {
 	return false, nil
 }
 
-// loadRegistry reads ~/.ccmc/tools.json and returns the entries. Returns an
-// empty slice (not an error) when the file does not exist.
+// loadRegistry reads ~/.ccmc/tools.json via Manager and returns the entries.
+// Returns an empty slice (not an error) when the file does not exist.
 func (i *Installer) loadRegistry() ([]ccmc.ToolRegistryEntry, error) {
-	b, err := os.ReadFile(i.registryPath)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("load registry: %w", err)
-	}
-	var entries []ccmc.ToolRegistryEntry
-	if err := json.Unmarshal(b, &entries); err != nil {
-		return nil, fmt.Errorf("load registry: parse: %w", err)
-	}
-	return entries, nil
+	return NewManager(i.registryPath).List()
 }
 
-// appendRegistry adds one entry to ~/.ccmc/tools.json, creating the file if
-// it does not exist.
-func (i *Installer) appendRegistry(entry ccmc.ToolRegistryEntry) error {
-	if err := os.MkdirAll(filepath.Dir(i.registryPath), 0o700); err != nil {
-		return fmt.Errorf("appendRegistry: mkdir: %w", err)
-	}
-
-	entries, err := i.loadRegistry()
-	if err != nil {
-		return err
-	}
-	entries = append(entries, entry)
-
-	b, err := json.MarshalIndent(entries, "", "  ")
-	if err != nil {
-		return fmt.Errorf("appendRegistry: marshal: %w", err)
-	}
-	b = append(b, '\n')
-
-	// Atomic write via temp file.
-	dir := filepath.Dir(i.registryPath)
-	f, err := os.CreateTemp(dir, ".ccmc-registry-*")
-	if err != nil {
-		return fmt.Errorf("appendRegistry: create temp: %w", err)
-	}
-	tmpPath := f.Name()
-	if err := os.Chmod(tmpPath, 0o600); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("appendRegistry: chmod: %w", err)
-	}
-	if _, err := f.Write(b); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("appendRegistry: write: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("appendRegistry: sync: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("appendRegistry: close: %w", err)
-	}
-	if err := os.Rename(tmpPath, i.registryPath); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("appendRegistry: rename: %w", err)
-	}
-	return nil
-}
 
 // ── Path resolution helpers ───────────────────────────────────────────────────
 
@@ -621,10 +573,36 @@ func mergeMCPServer(settingsPath, serverName string, entry map[string]json.RawMe
 	return config.WriteSettings(settingsPath, root)
 }
 
+// allowedMCPEntryKeys is the set of keys permitted when propagating an MCP
+// server entry from a repo's example settings.json into the user's settings.
+// Arbitrary keys from untrusted repos are dropped (H-2).
+var allowedMCPEntryKeys = map[string]bool{
+	"command": true,
+	"args":    true,
+	"env":     true,
+}
+
+// allowedMCPCommands is the set of bare interpreter names that may appear as
+// the "command" field in a repo's example settings.json. Absolute paths are
+// also permitted if they are under the cloned repo's own directory (H-2).
+var allowedMCPCommands = map[string]bool{
+	"node":    true,
+	"python":  true,
+	"python3": true,
+	"npx":     true,
+	"uvx":     true,
+	"bun":     true,
+	"deno":    true,
+}
+
 // resolveMCPStdioEntry tries to extract the command and args from the repo's
 // example settings.json. Falls back to a sensible default using the cloned repo
 // path and warns the caller when it cannot parse the example.
-func resolveMCPStdioEntry(toolName, cloneDest, exampleSettings string) (map[string]json.RawMessage, string) {
+//
+// H-2: only keys in allowedMCPEntryKeys are propagated; the command value is
+// validated against allowedMCPCommands or must be an absolute path under cloneDest.
+// Returns (nil, "", error) when the command from the example is unsafe.
+func resolveMCPStdioEntry(toolName, cloneDest, exampleSettings string) (map[string]json.RawMessage, string, error) {
 	if exampleSettings != "" {
 		var settings map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(exampleSettings), &settings); err == nil {
@@ -634,9 +612,24 @@ func resolveMCPStdioEntry(toolName, cloneDest, exampleSettings string) (map[stri
 					for _, srvRaw := range servers {
 						var srv map[string]json.RawMessage
 						if err := json.Unmarshal(srvRaw, &srv); err == nil {
-							if _, hasCmd := srv["command"]; hasCmd {
-								// Return the entry as-is from the example.
-								return srv, ""
+							if cmdRaw, hasCmd := srv["command"]; hasCmd {
+								// Decode command string value.
+								var cmdStr string
+								if err := json.Unmarshal(cmdRaw, &cmdStr); err != nil {
+									return nil, "", fmt.Errorf("resolveMCPStdioEntry: command is not a string: %w", err)
+								}
+								// Validate command (H-2).
+								if err := validateMCPCommand(cmdStr, cloneDest); err != nil {
+									return nil, "", err
+								}
+								// Propagate only allowlisted keys.
+								filtered := make(map[string]json.RawMessage, 3)
+								for k, v := range srv {
+									if allowedMCPEntryKeys[k] {
+										filtered[k] = v
+									}
+								}
+								return filtered, "", nil
 							}
 						}
 					}
@@ -676,7 +669,28 @@ func resolveMCPStdioEntry(toolName, cloneDest, exampleSettings string) (map[stri
 	}
 
 	warn := fmt.Sprintf("could not parse command from example settings.json for %s — using default: %s; verify mcpServers entry is correct", toolName, cmd)
-	return entry, warn
+	return entry, warn, nil
+}
+
+// validateMCPCommand returns nil when cmd is a known interpreter name or an
+// absolute path that is contained within cloneDest. All other values are rejected
+// to prevent writing arbitrary executables into the user's settings.json (H-2).
+func validateMCPCommand(cmd, cloneDest string) error {
+	// Bare known-interpreter names are always accepted.
+	if allowedMCPCommands[cmd] {
+		return nil
+	}
+	// Absolute paths must be under the cloned repo.
+	if filepath.IsAbs(cmd) {
+		cleanDest := filepath.Clean(cloneDest)
+		cleanCmd := filepath.Clean(cmd)
+		if strings.HasPrefix(cleanCmd, cleanDest+string(filepath.Separator)) || cleanCmd == cleanDest {
+			return nil
+		}
+		return fmt.Errorf("validateMCPCommand: command %q is an absolute path outside the cloned repo (%s) — refusing to write settings.json", cmd, cloneDest)
+	}
+	// Relative paths and anything else are rejected.
+	return fmt.Errorf("validateMCPCommand: command %q is not a known interpreter and is not an absolute path under the repo — refusing to write settings.json", cmd)
 }
 
 // extractSSEURL attempts to get the SSE URL from the example settings.json.
@@ -776,16 +790,40 @@ func findAgentFile(cloneDest, toolName string) string {
 
 // copyDir recursively copies src directory contents into dst. dst is created
 // if it does not exist.
+//
+// H-3: each entry is Lstat'd before copying. Symlinks in the source are skipped
+// with a warning (refusing-the-whole-install for a symlink would be too
+// disruptive; skipping is the right balance). Path-traversal entries (where
+// filepath.Clean(target) escapes dst) are refused with an error.
 func copyDir(src, dst string) error {
+	cleanDst := filepath.Clean(dst)
 	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
+
 		rel, err := filepath.Rel(src, path)
 		if err != nil {
 			return err
 		}
 		target := filepath.Join(dst, rel)
+
+		// Path-traversal guard: ensure target stays inside dst (H-3).
+		if !strings.HasPrefix(filepath.Clean(target), cleanDst+string(filepath.Separator)) && filepath.Clean(target) != cleanDst {
+			return fmt.Errorf("copyDir: path traversal detected: %q escapes destination %q", path, dst)
+		}
+
+		// Use Lstat to detect symlinks before following them (H-3).
+		fi, statErr := os.Lstat(path)
+		if statErr != nil {
+			return statErr
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			// Skip symlinks in source with a warning — do not abort the entire install.
+			fmt.Fprintf(os.Stderr, "installer: copyDir: skipping symlink %q\n", path)
+			return nil
+		}
+
 		if d.IsDir() {
 			return os.MkdirAll(target, 0o700)
 		}
@@ -795,17 +833,52 @@ func copyDir(src, dst string) error {
 
 // copyFile copies a single file from src to dst, creating the destination
 // directory if needed.
+//
+// H-3 source side: O_RDONLY|O_NOFOLLOW prevents following a source symlink.
+// H-3 dst side: O_CREATE|O_EXCL|O_NOFOLLOW prevents overwriting via a symlink
+// at the destination; if the destination already exists, we remove it first
+// (non-symlink regular files only) to achieve idempotent behaviour.
 func copyFile(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return err
 	}
-	in, err := os.Open(src)
+
+	// Open source with O_NOFOLLOW to refuse symlinks (H-3).
+	in, err := os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
+		if isELOOP(err) {
+			fmt.Fprintf(os.Stderr, "installer: copyFile: skipping symlink source %q\n", src)
+			return nil
+		}
 		return err
 	}
 	defer in.Close()
 
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	// Determine source permissions so executable bits are preserved.
+	srcInfo, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	perm := os.FileMode(0o644)
+	if srcInfo.Mode()&0o111 != 0 {
+		perm = 0o755
+	}
+
+	// If dst already exists and is a regular file, remove it so O_EXCL works
+	// idempotently. Refuse if dst is itself a symlink (H-3).
+	if dstInfo, err := os.Lstat(dst); err == nil {
+		if dstInfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("copyFile: destination %q is a symlink — refusing to write", dst)
+		}
+		if err := os.Remove(dst); err != nil {
+			return fmt.Errorf("copyFile: remove existing dst %q: %w", dst, err)
+		}
+	}
+
+	// O_EXCL ensures we only create a new file; combined with O_NOFOLLOW
+	// we refuse to write through a symlink that may have appeared between
+	// the Lstat above and now (H-3).
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, perm)
 	if err != nil {
 		return err
 	}
@@ -813,6 +886,16 @@ func copyFile(src, dst string) error {
 
 	_, err = io.Copy(out, in)
 	return err
+}
+
+// isELOOP reports whether err indicates a symlink loop (ELOOP), which is what
+// O_NOFOLLOW returns when the path itself is a symlink.
+func isELOOP(err error) bool {
+	// os.PathError wraps the syscall error.
+	if pe, ok := err.(*os.PathError); ok {
+		return pe.Err == syscall.ELOOP
+	}
+	return false
 }
 
 // toolNameFromURL extracts the repo name from a GitHub URL.

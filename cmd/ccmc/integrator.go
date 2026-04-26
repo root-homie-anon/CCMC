@@ -16,6 +16,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"text/tabwriter"
 
@@ -24,6 +25,11 @@ import (
 	"ccmc/internal/inventory"
 	"ccmc/pkg/ccmc"
 )
+
+// runInstallStdin is a package-level seam that tests replace to supply canned
+// stdin input to runInstall (mirrors the pattern used by runEval and runToolsRm).
+// When nil at runtime, os.Stdin is used.
+var runInstallStdin io.Reader
 
 // ── package-level seams ────────────────────────────────────────────────────────
 
@@ -234,10 +240,18 @@ func buildInventorySummary() string {
 // ── install ────────────────────────────────────────────────────────────────────
 
 // runInstall handles "ccmc install <github-url> [flags]".
+// stdin is the io.Reader for confirmation prompts (H-2). Callers that want to
+// suppress the prompt pass --no-prompt or --force. The package-level
+// runInstallStdin is used when the caller doesn't supply one directly.
 func runInstall(args []string, stdout, stderr io.Writer) int {
+	return runInstallWithReader(args, stdout, stderr, runInstallStdin)
+}
+
+func runInstallWithReader(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
 	var (
 		scope    string
 		force    bool
+		noPrompt bool
 		toolType string
 	)
 	rest := args
@@ -245,6 +259,10 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 		switch {
 		case rest[0] == "--force":
 			force = true
+			rest = rest[1:]
+			continue
+		case rest[0] == "--no-prompt":
+			noPrompt = true
 			rest = rest[1:]
 			continue
 		case strings.HasPrefix(rest[0], "--scope="):
@@ -268,10 +286,19 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 	}
 
 	if len(rest) == 0 {
-		fmt.Fprintln(stderr, "ccmc install: missing github-url\nUsage: ccmc install <github-url> [--scope global|<path>] [--force] [--type stdio|sse|skill|agent|plugin]")
+		fmt.Fprintln(stderr, "ccmc install: missing github-url\nUsage: ccmc install <github-url> [--scope global|<path>] [--force] [--no-prompt] [--type stdio|sse|skill|agent|plugin]")
 		return 2
 	}
 	rawURL := rest[0]
+
+	// C-2: validate and canonicalize URL via ParseURL before it reaches git clone.
+	// This rejects file://, ssh://, and flag-injection forms like --upload-pack=...
+	owner, repo, err := integrator.ParseURL(rawURL)
+	if err != nil {
+		fmt.Fprintf(stderr, "ccmc install: invalid URL %q: %v\n", rawURL, err)
+		return 1
+	}
+	canonicalURL := "https://github.com/" + owner + "/" + repo
 
 	cfg, err := config.Load(config.CcmcConfigPath())
 	if err != nil {
@@ -279,8 +306,25 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	// H-2: confirmation gate before settings.json is mutated.
+	// Skip when --force or --no-prompt is set (the eval flow uses doInstall
+	// after its own prior prompt, so it bypasses this gate via doInstall directly).
+	if !force && !noPrompt {
+		effectiveStdin := stdin
+		if effectiveStdin == nil {
+			effectiveStdin = os.Stdin
+		}
+		fmt.Fprintf(stdout, "Install %s and write mcpServers entry to settings.json? [y/N] ", canonicalURL)
+		reader := bufio.NewReader(effectiveStdin)
+		answer, _ := reader.ReadString('\n')
+		if !strings.EqualFold(strings.TrimSpace(answer), "y") {
+			fmt.Fprintln(stdout, "aborted")
+			return 0
+		}
+	}
+
 	src := integrator.InstallSource{
-		URL:      rawURL,
+		URL:      canonicalURL,
 		Scope:    scope,
 		ToolType: toolType,
 		Force:    force,

@@ -151,14 +151,18 @@ func (m *Manager) Remove(name string, deleteClone bool) error {
 }
 
 // gitPullCmd is a package-level variable so tests can stub the git invocation
-// without spawning a real process.
+// without spawning a real process. The "--" separator prevents git from
+// misinterpreting a path as a flag (C-2/M-2 defense-in-depth).
 var gitPullCmd = func(clonePath string) *exec.Cmd {
-	return exec.Command("git", "-C", clonePath, "pull")
+	return exec.Command("git", "-C", "--", clonePath, "pull")
 }
 
 // Update runs git pull in the clone directory for the named tool. It is a no-op
 // (returns nil) for types without a clone path (skill, agent, sse). An
 // informational note is written to stderr for those types.
+//
+// M-2: the clone path is prefix-checked against config.CcmcDir() before
+// invoking git pull, mirroring the guard in safeRemoveClone.
 func (m *Manager) Update(name string) error {
 	entry, err := m.Get(name)
 	if err != nil {
@@ -168,6 +172,20 @@ func (m *Manager) Update(name string) error {
 	if entry.ClonePath == "" {
 		fmt.Fprintf(os.Stderr, "manager: nothing to update for type %s (no clone path)\n", entry.Type)
 		return nil
+	}
+
+	// M-2: guard against a corrupt registry pointing clone_path outside the
+	// allowed clone directory. Mirrors safeRemoveClone's logic.
+	abs, err := filepath.Abs(entry.ClonePath)
+	if err != nil {
+		return fmt.Errorf("manager: resolve clone path %s: %w", entry.ClonePath, err)
+	}
+	allowedAbs, err := filepath.Abs(config.CcmcDir())
+	if err != nil {
+		return fmt.Errorf("manager: resolve allowed base: %w", err)
+	}
+	if !strings.HasPrefix(abs, allowedAbs+string(filepath.Separator)) && abs != allowedAbs {
+		return fmt.Errorf("manager: clone_path %s is outside allowed directory %s — refusing to update", entry.ClonePath, config.CcmcDir())
 	}
 
 	cmd := gitPullCmd(entry.ClonePath)

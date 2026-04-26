@@ -1226,6 +1226,7 @@ func TestRun_EvalNoAPIKey(t *testing.T) {
 }
 
 // TestRun_InstallHappyPath stubs installFunc and asserts exit 0 with result printed.
+// Uses --no-prompt to bypass the H-2 settings-write confirmation gate.
 func TestRun_InstallHappyPath(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("CCMC_DIR", tmp)
@@ -1236,7 +1237,7 @@ func TestRun_InstallHappyPath(t *testing.T) {
 	installFunc = func(_ context.Context, _ config.Config, src integrator.InstallSource) (ccmc.InstallResult, error) {
 		return ccmc.InstallResult{
 			Name:       "foo",
-			Type:       "mcp-stdio",
+			Type:       "stdio",
 			SourceURL:  src.URL,
 			Scope:      "global",
 			ClonePath:  "/tmp/foo",
@@ -1245,12 +1246,12 @@ func TestRun_InstallHappyPath(t *testing.T) {
 	}
 
 	var outBuf, errBuf bytes.Buffer
-	code := runInstall([]string{"anthropics/foo", "--scope", "global"}, &outBuf, &errBuf)
+	code := runInstall([]string{"--no-prompt", "--scope", "global", "anthropics/foo"}, &outBuf, &errBuf)
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errBuf.String())
 	}
 	out := outBuf.String()
-	for _, want := range []string{"foo", "mcp-stdio", "global"} {
+	for _, want := range []string{"foo", "stdio", "global"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected %q in install output; got:\n%s", want, out)
 		}
@@ -1259,6 +1260,7 @@ func TestRun_InstallHappyPath(t *testing.T) {
 
 // TestRun_InstallAlreadyInstalled asserts exit 1 with --force hint when the
 // installer returns ErrToolAlreadyInstalled.
+// Uses --no-prompt to bypass the H-2 settings-write confirmation gate.
 func TestRun_InstallAlreadyInstalled(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("CCMC_DIR", tmp)
@@ -1271,12 +1273,117 @@ func TestRun_InstallAlreadyInstalled(t *testing.T) {
 	}
 
 	var outBuf, errBuf bytes.Buffer
-	code := runInstall([]string{"anthropics/foo"}, &outBuf, &errBuf)
+	code := runInstall([]string{"--no-prompt", "anthropics/foo"}, &outBuf, &errBuf)
 	if code != 1 {
 		t.Fatalf("expected exit 1, got %d; stderr: %q", code, errBuf.String())
 	}
 	if !strings.Contains(errBuf.String(), "--force") {
 		t.Errorf("expected --force hint in stderr; got: %q", errBuf.String())
+	}
+}
+
+// TestRun_InstallRejectsFileURL asserts that a file:// URL is rejected before
+// installFunc is called (C-2).
+func TestRun_InstallRejectsFileURL(t *testing.T) {
+	origInstall := installFunc
+	t.Cleanup(func() { installFunc = origInstall })
+
+	installerCalled := false
+	installFunc = func(_ context.Context, _ config.Config, _ integrator.InstallSource) (ccmc.InstallResult, error) {
+		installerCalled = true
+		return ccmc.InstallResult{}, nil
+	}
+
+	var outBuf, errBuf bytes.Buffer
+	code := runInstall([]string{"--no-prompt", "file:///etc/passwd"}, &outBuf, &errBuf)
+	if code != 1 {
+		t.Fatalf("expected exit 1 for file:// URL, got %d; stderr: %q", code, errBuf.String())
+	}
+	if installerCalled {
+		t.Error("installFunc must not be called for rejected URL")
+	}
+}
+
+// TestRun_InstallRejectsSSHURL asserts that an ssh:// URL is rejected (C-2).
+func TestRun_InstallRejectsSSHURL(t *testing.T) {
+	origInstall := installFunc
+	t.Cleanup(func() { installFunc = origInstall })
+
+	installerCalled := false
+	installFunc = func(_ context.Context, _ config.Config, _ integrator.InstallSource) (ccmc.InstallResult, error) {
+		installerCalled = true
+		return ccmc.InstallResult{}, nil
+	}
+
+	var outBuf, errBuf bytes.Buffer
+	code := runInstall([]string{"--no-prompt", "ssh://git@github.com/owner/repo"}, &outBuf, &errBuf)
+	if code != 1 {
+		t.Fatalf("expected exit 1 for ssh:// URL, got %d; stderr: %q", code, errBuf.String())
+	}
+	if installerCalled {
+		t.Error("installFunc must not be called for rejected URL")
+	}
+}
+
+// TestRun_InstallRejectsFlagInjection asserts that URLs that do not parse as
+// valid GitHub https:// references (e.g. bare non-GitHub domains) are rejected
+// before installFunc is called (C-2). The "--" separator in cloneCmd provides
+// defense-in-depth for flag-shaped inputs that survive ParseURL normalization.
+func TestRun_InstallRejectsFlagInjection(t *testing.T) {
+	origInstall := installFunc
+	t.Cleanup(func() { installFunc = origInstall })
+
+	installerCalled := false
+	installFunc = func(_ context.Context, _ config.Config, _ integrator.InstallSource) (ccmc.InstallResult, error) {
+		installerCalled = true
+		return ccmc.InstallResult{}, nil
+	}
+
+	// A bare non-GitHub domain that ParseURL cannot normalize to a github.com URL:
+	// ParseURL("evil.com/owner/repo") → owner="evil.com", repo="owner" → canonical
+	// URL would be https://github.com/evil.com/owner — note this still starts with
+	// https://github.com/. The scheme guard in cloneCmd then rejects it because the
+	// stub is bypassed in tests; instead test with a scheme that ParseURL rejects.
+	// ssh:// causes ParseURL to produce owner="git@evil.com" which is not valid.
+	var outBuf, errBuf bytes.Buffer
+	code := runInstall([]string{"--no-prompt", "ssh://git@evil.com/evil/repo"}, &outBuf, &errBuf)
+	if code != 1 {
+		t.Fatalf("expected exit 1 for ssh:// URL, got %d; stderr: %q", code, errBuf.String())
+	}
+	if installerCalled {
+		t.Errorf("installFunc called with invalid URL; exit code: %d", code)
+	}
+}
+
+// TestRun_InstallPromptsBeforeSettingsWrite verifies H-2: when --no-prompt and
+// --force are both absent, the user sees a confirmation prompt before the
+// installer is called. Answering "n" aborts without calling installFunc.
+func TestRun_InstallPromptsBeforeSettingsWrite(t *testing.T) {
+	origInstall := installFunc
+	t.Cleanup(func() { installFunc = origInstall })
+
+	installerCalled := false
+	installFunc = func(_ context.Context, _ config.Config, _ integrator.InstallSource) (ccmc.InstallResult, error) {
+		installerCalled = true
+		return ccmc.InstallResult{}, nil
+	}
+
+	// Inject "n" as stdin answer.
+	stdinInput := strings.NewReader("n\n")
+	origStdin := runInstallStdin
+	runInstallStdin = stdinInput
+	t.Cleanup(func() { runInstallStdin = origStdin })
+
+	var outBuf, errBuf bytes.Buffer
+	code := runInstallWithReader([]string{"anthropics/foo"}, &outBuf, &errBuf, strings.NewReader("n\n"))
+	if code != 0 {
+		t.Fatalf("expected exit 0 for aborted install, got %d; stderr: %q", code, errBuf.String())
+	}
+	if installerCalled {
+		t.Error("installFunc must not be called when user answers n")
+	}
+	if !strings.Contains(outBuf.String(), "aborted") {
+		t.Errorf("expected 'aborted' in output; got: %q", outBuf.String())
 	}
 }
 

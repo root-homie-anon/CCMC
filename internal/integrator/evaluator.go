@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"ccmc/pkg/ccmc"
 )
@@ -85,6 +86,9 @@ func WithEvalModel(model string) EvalOption {
 
 // WithEvalBaseURL overrides the Anthropic API base URL. Used in tests to point
 // at an httptest.Server instead of the real endpoint.
+//
+// TEST-ONLY: production code MUST NOT call this — see x-api-key guard in
+// Evaluate which refuses to send the key to any non-anthropic base URL.
 func WithEvalBaseURL(url string) EvalOption {
 	return func(e *Evaluator) {
 		e.baseURL = strings.TrimRight(url, "/")
@@ -231,7 +235,12 @@ func (e *Evaluator) Evaluate(ctx context.Context, repo ccmc.EvalContext, current
 	if err != nil {
 		return ccmc.EvalResult{}, fmt.Errorf("evaluator: create request: %w", err)
 	}
-	req.Header.Set("x-api-key", e.apiKey)
+	// M-3: only send the API key to the canonical Anthropic base URL.
+	// WithEvalBaseURL is a test seam — if someone misconfigures it in production,
+	// we must not leak the key to an arbitrary server.
+	if e.baseURL == anthropicBaseURL {
+		req.Header.Set("x-api-key", e.apiKey)
+	}
 	req.Header.Set("anthropic-version", anthropicVersion)
 	req.Header.Set("content-type", "application/json")
 
@@ -262,7 +271,9 @@ func (e *Evaluator) Evaluate(ctx context.Context, repo ccmc.EvalContext, current
 
 	var result ccmc.EvalResult
 	if err := json.Unmarshal([]byte(rawText), &result); err != nil {
-		return ccmc.EvalResult{}, fmt.Errorf("%w: %s — raw: %s", ErrParseResult, err.Error(), rawText)
+		// L-3: strip non-printable bytes before including API response in errors
+		// to prevent terminal control-sequence injection via malicious API responses.
+		return ccmc.EvalResult{}, fmt.Errorf("%w: %s — raw: %s", ErrParseResult, err.Error(), sanitizePrintable(rawText))
 	}
 
 	return result, nil
@@ -341,4 +352,36 @@ func buildUserMessage(repo ccmc.EvalContext, currentInventory string) string {
 	}
 
 	return sb.String()
+}
+
+// sanitizePrintable strips non-printable runes from s before it is included in
+// error messages or written to stderr. This prevents terminal control-sequence
+// injection when untrusted API response bytes are echoed to a terminal (L-3).
+//
+// Allowed: printable ASCII (0x20–0x7E), TAB (0x09), LF (0x0A).
+// Stripped: everything else including DEL (0x7F), C1 control codes (0x80–0x9F),
+// and any non-ASCII bytes that are not valid printable Unicode.
+func sanitizePrintable(s string) string {
+	if s == "" {
+		return s
+	}
+	b := make([]byte, 0, len(s))
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		if r == utf8.RuneError && size == 1 {
+			// Invalid UTF-8 byte — drop it.
+			continue
+		}
+		if r == '\t' || r == '\n' {
+			b = append(b, byte(r))
+			continue
+		}
+		if r >= 0x20 && r <= 0x7E {
+			b = append(b, byte(r))
+			continue
+		}
+		// Drop everything else (control codes, C1, surrogates, etc.).
+	}
+	return string(b)
 }

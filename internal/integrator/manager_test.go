@@ -304,7 +304,12 @@ func TestRemove_NotFound(t *testing.T) {
 }
 
 func TestUpdate_StdioRunsGitPull(t *testing.T) {
-	m, _ := newTestManager(t)
+	// M-2: Update guards clone_path against config.CcmcDir(). Point CCMC_DIR at
+	// a temp dir and place the clone path inside it so the guard passes.
+	ccmcDir := t.TempDir()
+	t.Setenv("CCMC_DIR", ccmcDir)
+	registryPath := filepath.Join(ccmcDir, "tools.json")
+	m := NewManager(registryPath)
 
 	var capturedPath string
 	gitPullCmd = func(clonePath string) *exec.Cmd {
@@ -314,11 +319,15 @@ func TestUpdate_StdioRunsGitPull(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		gitPullCmd = func(clonePath string) *exec.Cmd {
-			return exec.Command("git", "-C", clonePath, "pull")
+			return exec.Command("git", "-C", "--", clonePath, "pull")
 		}
 	})
 
-	clonePath := t.TempDir()
+	// Clone path must be inside ccmcDir for the M-2 guard to pass.
+	clonePath := filepath.Join(ccmcDir, "tools", "stdio-tool")
+	if err := os.MkdirAll(clonePath, 0o700); err != nil {
+		t.Fatalf("mkdir clone path: %v", err)
+	}
 	writeRegistry(t, m.registryPath, []ccmc.ToolRegistryEntry{
 		{Name: "stdio-tool", Type: "stdio", Scope: "global", ClonePath: clonePath, InstalledAt: time.Now().Format(time.RFC3339)},
 	})
@@ -341,7 +350,7 @@ func TestUpdate_NoCloneIsNoop(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		gitPullCmd = func(clonePath string) *exec.Cmd {
-			return exec.Command("git", "-C", clonePath, "pull")
+			return exec.Command("git", "-C", "--", clonePath, "pull")
 		}
 	})
 

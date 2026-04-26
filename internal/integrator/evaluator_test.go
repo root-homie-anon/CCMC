@@ -232,8 +232,10 @@ func TestEvaluate_TimeoutFires(t *testing.T) {
 	}
 }
 
-// TestEvaluate_HeadersSent — stub asserts that the required Anthropic headers
-// are present on every request.
+// TestEvaluate_HeadersSent — stub asserts that the required non-secret Anthropic
+// headers (anthropic-version, content-type) are always sent. The x-api-key header
+// is only sent to the real Anthropic base URL (M-3 guard); this test uses an
+// httptest server so x-api-key must NOT be present.
 func TestEvaluate_HeadersSent(t *testing.T) {
 	var (
 		gotAPIKey  string
@@ -262,14 +264,43 @@ func TestEvaluate_HeadersSent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if gotAPIKey != wantKey {
-		t.Errorf("x-api-key = %q; want %q", gotAPIKey, wantKey)
+	// M-3: x-api-key must NOT be sent to a non-Anthropic base URL.
+	if gotAPIKey != "" {
+		t.Errorf("x-api-key should not be sent to non-Anthropic URL; got %q", gotAPIKey)
 	}
 	if gotVersion != anthropicVersion {
 		t.Errorf("anthropic-version = %q; want %q", gotVersion, anthropicVersion)
 	}
 	if gotCT != "application/json" {
 		t.Errorf("content-type = %q; want application/json", gotCT)
+	}
+}
+
+// TestEvaluate_RefusesAPIKeyOnNonAnthropicURL verifies M-3: when the base URL
+// is not the canonical Anthropic endpoint, the x-api-key header is withheld.
+func TestEvaluate_RefusesAPIKeyOnNonAnthropicURL(t *testing.T) {
+	var receivedAPIKey string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAPIKey = r.Header.Get("x-api-key")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(anthropicShape(t, validEvalResultJSON))
+	}))
+	defer srv.Close()
+
+	eval := NewEvaluator(
+		WithEvalAPIKey("super-secret-key"),
+		WithEvalBaseURL(srv.URL),
+	)
+
+	_, err := eval.Evaluate(context.Background(), sampleRepo(), "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if receivedAPIKey != "" {
+		t.Errorf("M-3 violation: x-api-key %q was sent to non-Anthropic server", receivedAPIKey)
 	}
 }
 
