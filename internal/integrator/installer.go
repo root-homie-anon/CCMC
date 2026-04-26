@@ -33,6 +33,11 @@ var (
 	// ErrToolAlreadyInstalled is returned when the registry already contains an
 	// entry for the same SourceURL+Scope combination and Force is false.
 	ErrToolAlreadyInstalled = errors.New("installer: tool already installed")
+
+	// ErrStalePartialInstall is returned when a previous partial install left a
+	// target directory in place. The caller should pass --force to remove it and
+	// retry, or run `ccmc tools rm <name>` to clean up manually.
+	ErrStalePartialInstall = errors.New("installer: stale partial install")
 )
 
 // cloneCmd is a package-level seam that tests replace to avoid real git invocations.
@@ -356,6 +361,17 @@ func (i *Installer) installSkill(ctx context.Context, src InstallSource, toolNam
 
 	// Determine target directory based on scope.
 	targetBase := resolveSkillDir(src.Scope, toolName)
+	// allowedSkillsBase is the parent skills directory; used by prepareTargetDir
+	// as the RemoveAll safety boundary so a corrupt targetBase cannot escape ~/.claude/.
+	allowedSkillsBase := filepath.Dir(targetBase)
+
+	// NF-3: if targetBase already exists, a prior install aborted mid-copy. Refuse
+	// (or remove on --force) before invoking copyDir so O_EXCL does not fail on
+	// previously-written files, leaving the install in a perpetually broken state.
+	if err := prepareTargetDir(targetBase, allowedSkillsBase, src.Force); err != nil {
+		return ccmc.InstallResult{}, err
+	}
+
 	if err := os.MkdirAll(targetBase, 0o700); err != nil {
 		return ccmc.InstallResult{}, fmt.Errorf("%w: mkdir target: %v", ErrConfigWriteFailed, err)
 	}
@@ -454,8 +470,13 @@ func (i *Installer) installPlugin(ctx context.Context, src InstallSource, toolNa
 	}
 
 	pluginsDir := resolvePluginDir(src.Scope, toolName)
-	if err := os.MkdirAll(filepath.Dir(pluginsDir), 0o700); err != nil {
+	allowedPluginsBase := filepath.Dir(pluginsDir)
+	if err := os.MkdirAll(allowedPluginsBase, 0o700); err != nil {
 		return ccmc.InstallResult{}, fmt.Errorf("%w: mkdir plugins dir: %v", ErrConfigWriteFailed, err)
+	}
+	// NF-3: guard against stale partial install before copyDir.
+	if err := prepareTargetDir(pluginsDir, allowedPluginsBase, src.Force); err != nil {
+		return ccmc.InstallResult{}, err
 	}
 	if err := copyDir(cloneDest, pluginsDir); err != nil {
 		return ccmc.InstallResult{}, fmt.Errorf("%w: copy plugin: %v", ErrConfigWriteFailed, err)
@@ -786,6 +807,46 @@ func findAgentFile(cloneDest, toolName string) string {
 	}
 
 	return ""
+}
+
+// prepareTargetDir ensures targetDir is ready for a fresh copyDir. If targetDir
+// exists, it is a stale partial install (O_EXCL in copyFile would fail on any
+// previously-copied file). Behaviour depends on force:
+//   - force=false: return ErrStalePartialInstall with a guidance message so the
+//     user can clean up intentionally (`ccmc tools rm <name>` or --force).
+//   - force=true: remove targetDir entirely, subject to a prefix safety check
+//     (targetDir must begin with allowedBase to prevent RemoveAll on arbitrary
+//     paths).
+func prepareTargetDir(targetDir, allowedBase string, force bool) error {
+	if _, err := os.Stat(targetDir); os.IsNotExist(err) {
+		// Nothing there — no action needed.
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("prepareTargetDir: stat %s: %w", targetDir, err)
+	}
+
+	if !force {
+		return fmt.Errorf("%w: stale partial install detected at %s; run `ccmc tools rm <name>` first or re-run with --force",
+			ErrStalePartialInstall, targetDir)
+	}
+
+	// Safety check: targetDir must be under allowedBase.
+	absTarget, err := filepath.Abs(targetDir)
+	if err != nil {
+		return fmt.Errorf("prepareTargetDir: resolve target %s: %w", targetDir, err)
+	}
+	absAllowed, err := filepath.Abs(allowedBase)
+	if err != nil {
+		return fmt.Errorf("prepareTargetDir: resolve allowed base %s: %w", allowedBase, err)
+	}
+	if !strings.HasPrefix(absTarget, absAllowed+string(filepath.Separator)) && absTarget != absAllowed {
+		return fmt.Errorf("prepareTargetDir: %s is outside allowed base %s — refusing RemoveAll", targetDir, allowedBase)
+	}
+
+	if err := os.RemoveAll(absTarget); err != nil {
+		return fmt.Errorf("prepareTargetDir: remove stale dir %s: %w", absTarget, err)
+	}
+	return nil
 }
 
 // copyDir recursively copies src directory contents into dst. dst is created

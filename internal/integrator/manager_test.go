@@ -319,7 +319,7 @@ func TestUpdate_StdioRunsGitPull(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		gitPullCmd = func(clonePath string) *exec.Cmd {
-			return exec.Command("git", "-C", "--", clonePath, "pull")
+			return exec.Command("git", "-C", clonePath, "pull")
 		}
 	})
 
@@ -350,7 +350,7 @@ func TestUpdate_NoCloneIsNoop(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		gitPullCmd = func(clonePath string) *exec.Cmd {
-			return exec.Command("git", "-C", "--", clonePath, "pull")
+			return exec.Command("git", "-C", clonePath, "pull")
 		}
 	})
 
@@ -384,5 +384,47 @@ func TestRegistry_SymlinkRefused(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "symlink") {
 		t.Errorf("expected 'symlink' in error, got: %v", err)
+	}
+}
+
+// TestUpdate_ActuallyRunsGitPull verifies that the gitPullCmd seam is invoked
+// with exactly the args ["-C", clonePath, "pull"] — not the previously broken
+// ["-C", "--", clonePath, "pull"] form that caused git to chdir into "--".
+func TestUpdate_ActuallyRunsGitPull(t *testing.T) {
+	ccmcDir := t.TempDir()
+	t.Setenv("CCMC_DIR", ccmcDir)
+	registryPath := filepath.Join(ccmcDir, "tools.json")
+	m := NewManager(registryPath)
+
+	var capturedArgs []string
+	origGitPull := gitPullCmd
+	gitPullCmd = func(clonePath string) *exec.Cmd {
+		// Reconstruct the full arg list the real gitPullCmd would produce so we
+		// can assert the exact shape, then return a no-op command.
+		capturedArgs = []string{"-C", clonePath, "pull"}
+		return exec.Command("true")
+	}
+	t.Cleanup(func() { gitPullCmd = origGitPull })
+
+	clonePath := filepath.Join(ccmcDir, "tools", "my-tool")
+	if err := os.MkdirAll(clonePath, 0o700); err != nil {
+		t.Fatalf("mkdir clone path: %v", err)
+	}
+	writeRegistry(t, m.registryPath, []ccmc.ToolRegistryEntry{
+		{Name: "my-tool", Type: "stdio", Scope: "global", ClonePath: clonePath, InstalledAt: time.Now().Format(time.RFC3339)},
+	})
+
+	if err := m.Update("my-tool"); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	wantArgs := []string{"-C", clonePath, "pull"}
+	if len(capturedArgs) != len(wantArgs) {
+		t.Fatalf("git args len = %d, want %d; got %v", len(capturedArgs), len(wantArgs), capturedArgs)
+	}
+	for i, a := range wantArgs {
+		if capturedArgs[i] != a {
+			t.Errorf("git arg[%d] = %q, want %q (full args: %v)", i, capturedArgs[i], a, capturedArgs)
+		}
 	}
 }

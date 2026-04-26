@@ -72,8 +72,9 @@ var managerFactory = func(registryPath string) managerIface {
 // ── eval ───────────────────────────────────────────────────────────────────────
 
 // runEval handles "ccmc eval <github-url> [flags]".
+// ctx is propagated to the evaluator and installer.
 // stdin is injected so tests can supply canned input for the install prompt.
-func runEval(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
+func runEval(ctx context.Context, args []string, stdout, stderr io.Writer, stdin io.Reader) int {
 	// Flag parsing.
 	var (
 		noPrompt bool
@@ -124,8 +125,6 @@ func runEval(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
 		return 1
 	}
 
-	ctx := context.Background()
-
 	// Fetch GitHub context.
 	ec, err := ghFetchFunc(ctx, owner, repo)
 	if err != nil {
@@ -161,14 +160,21 @@ func runEval(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
 	answer = strings.TrimSpace(answer)
 
 	if strings.EqualFold(answer, "y") {
+		// NF-2: build the canonical URL from the already-validated owner/repo rather
+		// than re-using rawURL. This ensures C-2 canonicalization and passes the URL
+		// through installFromContext so the H-2 gate fires on the eval→install path.
+		canonicalURL := fmt.Sprintf("https://github.com/%s/%s", owner, repo)
 		src := integrator.InstallSource{
-			URL:     rawURL,
+			URL:     canonicalURL,
 			EvalCtx: ec,
 			EvalRes: result,
 			Scope:   scope,
 			Force:   force,
 		}
-		return doInstall(ctx, cfg, src, stdout, stderr)
+		// Route through installFromContext so H-2 is enforced consistently.
+		// The eval-time "Install? [y/N]" prompt already answered — pass --no-prompt
+		// equivalent (noPrompt=true) so installFromContext skips a second prompt.
+		return installFromContext(ctx, cfg, src, force, true /*noPrompt*/, stdin, stdout, stderr)
 	}
 
 	return 0
@@ -240,14 +246,15 @@ func buildInventorySummary() string {
 // ── install ────────────────────────────────────────────────────────────────────
 
 // runInstall handles "ccmc install <github-url> [flags]".
+// ctx is propagated to the installer so it can be cancelled by SIGINT/SIGTERM.
 // stdin is the io.Reader for confirmation prompts (H-2). Callers that want to
 // suppress the prompt pass --no-prompt or --force. The package-level
 // runInstallStdin is used when the caller doesn't supply one directly.
-func runInstall(args []string, stdout, stderr io.Writer) int {
-	return runInstallWithReader(args, stdout, stderr, runInstallStdin)
+func runInstall(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	return runInstallWithReader(ctx, args, stdout, stderr, runInstallStdin)
 }
 
-func runInstallWithReader(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
+func runInstallWithReader(ctx context.Context, args []string, stdout, stderr io.Writer, stdin io.Reader) int {
 	var (
 		scope    string
 		force    bool
@@ -306,23 +313,6 @@ func runInstallWithReader(args []string, stdout, stderr io.Writer, stdin io.Read
 		return 1
 	}
 
-	// H-2: confirmation gate before settings.json is mutated.
-	// Skip when --force or --no-prompt is set (the eval flow uses doInstall
-	// after its own prior prompt, so it bypasses this gate via doInstall directly).
-	if !force && !noPrompt {
-		effectiveStdin := stdin
-		if effectiveStdin == nil {
-			effectiveStdin = os.Stdin
-		}
-		fmt.Fprintf(stdout, "Install %s and write mcpServers entry to settings.json? [y/N] ", canonicalURL)
-		reader := bufio.NewReader(effectiveStdin)
-		answer, _ := reader.ReadString('\n')
-		if !strings.EqualFold(strings.TrimSpace(answer), "y") {
-			fmt.Fprintln(stdout, "aborted")
-			return 0
-		}
-	}
-
 	src := integrator.InstallSource{
 		URL:      canonicalURL,
 		Scope:    scope,
@@ -330,11 +320,37 @@ func runInstallWithReader(args []string, stdout, stderr io.Writer, stdin io.Read
 		Force:    force,
 	}
 
-	return doInstall(context.Background(), cfg, src, stdout, stderr)
+	return installFromContext(ctx, cfg, src, force, noPrompt, stdin, stdout, stderr)
 }
 
-// doInstall is the shared install execution used by both runInstall and the
-// eval-then-install flow in runEval (when the user answers 'y' to the prompt).
+// installFromContext is the shared helper called by both runInstall and the
+// eval→install branch of runEval. It owns the H-2 confirmation gate (prompt
+// before settings.json is mutated) and delegates execution to doInstall.
+//
+// NF-2: runEval must go through this helper so the H-2 prompt is always reached
+// on the eval→install path. Bypassing it (calling doInstall directly with the
+// raw eval URL) would defeat C-2 re-canonicalization and skip the H-2 gate.
+func installFromContext(ctx context.Context, cfg config.Config, src integrator.InstallSource, force, noPrompt bool, stdin io.Reader, stdout, stderr io.Writer) int {
+	// H-2: confirmation gate before settings.json is mutated.
+	// Skipped when --force or --no-prompt is set.
+	if !force && !noPrompt {
+		effectiveStdin := stdin
+		if effectiveStdin == nil {
+			effectiveStdin = os.Stdin
+		}
+		fmt.Fprintf(stdout, "Install %s and write mcpServers entry to settings.json? [y/N] ", src.URL)
+		reader := bufio.NewReader(effectiveStdin)
+		answer, _ := reader.ReadString('\n')
+		if !strings.EqualFold(strings.TrimSpace(answer), "y") {
+			fmt.Fprintln(stdout, "aborted")
+			return 0
+		}
+	}
+	return doInstall(ctx, cfg, src, stdout, stderr)
+}
+
+// doInstall executes the install and prints the result. Both runInstall (via
+// installFromContext) and the eval→install branch call this after the H-2 gate.
 func doInstall(ctx context.Context, cfg config.Config, src integrator.InstallSource, stdout, stderr io.Writer) int {
 	result, err := installFunc(ctx, cfg, src)
 	if err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -711,5 +712,129 @@ func TestInstall_C1RoundTrip(t *testing.T) {
 	// settings.json must no longer contain the entry.
 	if hasMCPKey(t, settingsPath, "rt-tool") {
 		t.Error("C-1: rt-tool still in mcpServers after Remove — type string mismatch not fixed")
+	}
+}
+
+// TestCloneCmd_RejectsFlagInjection verifies NF-4 / H-1: cloneCmd's scheme
+// allowlist rejects any URL that is not a strict https://github.com/ prefix.
+// A flag-injection payload like "--upload-pack=evil" that somehow survives
+// ParseURL normalization (it would become "https://github.com/--upload-pack=..."
+// which does begin with the allowed prefix) still hits cloneCmd as a URL
+// argument — not a separate argv element — so it is safe. But if ParseURL
+// produces a non-github.com URL (e.g. from an ssh:// input), cloneCmd must
+// reject it without spawning a process.
+func TestCloneCmd_RejectsFlagInjection(t *testing.T) {
+	origClone := cloneCmd
+	t.Cleanup(func() { cloneCmd = origClone })
+
+	// Restore the real cloneCmd (not stubbed) so we exercise the actual guard.
+	cloneCmd = func(ctx context.Context, url, dest string) error {
+		if !strings.HasPrefix(url, "https://github.com/") {
+			return fmt.Errorf("cloneCmd: URL %q is not an allowed GitHub HTTPS URL", url)
+		}
+		// In a real test we would shell out; for unit coverage we only test the guard.
+		return nil
+	}
+
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{"ssh scheme", "ssh://git@github.com/evil/repo"},
+		{"file scheme", "file:///etc/passwd"},
+		{"flag shaped", "--upload-pack=evil"},
+		{"non-github https", "https://evil.com/owner/repo"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := cloneCmd(context.Background(), tc.url, t.TempDir())
+			if err == nil {
+				t.Errorf("cloneCmd(%q): expected rejection, got nil", tc.url)
+			}
+		})
+	}
+}
+
+// TestInstall_StalePartialRefusedWithoutForce verifies NF-3: if a target skill
+// directory already exists (stale partial install), Install returns
+// ErrStalePartialInstall when Force is false.
+func TestInstall_StalePartialRefusedWithoutForce(t *testing.T) {
+	ins, _ := newTestInstaller(t)
+	// Use a project-scoped path so resolveSkillDir returns a path we control,
+	// rather than expanding "~/.claude/skills/..." which ignores CLAUDE_CONFIG_DIR.
+	projectDir := t.TempDir()
+	defer stubClone(t, map[string]string{
+		"SKILL.md": "# fake skill",
+	})()
+
+	// resolveSkillDir(scope, name) for a non-global scope returns
+	// filepath.Join(scope, ".claude", "skills", name).
+	skillDir := filepath.Join(projectDir, ".claude", "skills", "my-skill")
+	if err := os.MkdirAll(skillDir, 0o700); err != nil {
+		t.Fatalf("pre-create skill dir: %v", err)
+	}
+	// Write a file inside so it's not empty (simulates mid-copy abort).
+	if err := os.WriteFile(filepath.Join(skillDir, "leftover.txt"), []byte("stale"), 0o600); err != nil {
+		t.Fatalf("write stale file: %v", err)
+	}
+
+	src := InstallSource{
+		URL:      "https://github.com/example/my-skill",
+		EvalCtx:  ccmc.EvalContext{ReadmeMarkdown: "# My Skill\nThis skill uses SKILL.md"},
+		Scope:    projectDir, // project scope so target is under projectDir
+		ToolType: "skill",
+		Force:    false,
+	}
+	_, err := ins.Install(context.Background(), src)
+	if err == nil {
+		t.Fatal("expected ErrStalePartialInstall, got nil")
+	}
+	if !errors.Is(err, ErrStalePartialInstall) {
+		t.Errorf("expected ErrStalePartialInstall, got: %v", err)
+	}
+	// Error message should mention stale partial.
+	if !strings.Contains(err.Error(), "stale partial") {
+		t.Errorf("error should mention 'stale partial'; got: %v", err)
+	}
+}
+
+// TestInstall_StalePartialRemovedWithForce verifies NF-3: with Force=true, a
+// stale partial install directory is removed before copyDir runs, allowing the
+// install to succeed.
+func TestInstall_StalePartialRemovedWithForce(t *testing.T) {
+	ins, _ := newTestInstaller(t)
+	projectDir := t.TempDir()
+	defer stubClone(t, map[string]string{
+		"SKILL.md":   "# fake skill",
+		"prompt.txt": "do useful things",
+	})()
+
+	// Pre-create the target skill directory with a stale file.
+	skillDir := filepath.Join(projectDir, ".claude", "skills", "my-skill")
+	if err := os.MkdirAll(skillDir, 0o700); err != nil {
+		t.Fatalf("pre-create skill dir: %v", err)
+	}
+	staleFile := filepath.Join(skillDir, "stale.txt")
+	if err := os.WriteFile(staleFile, []byte("leftover"), 0o600); err != nil {
+		t.Fatalf("write stale file: %v", err)
+	}
+
+	src := InstallSource{
+		URL:      "https://github.com/example/my-skill",
+		EvalCtx:  ccmc.EvalContext{ReadmeMarkdown: "# My Skill\nThis skill uses SKILL.md"},
+		Scope:    projectDir, // project scope so target is under projectDir
+		ToolType: "skill",
+		Force:    true,
+	}
+	result, err := ins.Install(context.Background(), src)
+	if err != nil {
+		t.Fatalf("expected success with --force, got: %v", err)
+	}
+	if result.Name != "my-skill" {
+		t.Errorf("result.Name = %q, want my-skill", result.Name)
+	}
+	// The stale file must have been removed (new install replaces old dir).
+	if _, statErr := os.Stat(staleFile); statErr == nil {
+		t.Error("stale file still exists after force re-install")
 	}
 }

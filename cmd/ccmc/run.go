@@ -49,6 +49,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runDashboard(stderr)
 	}
 
+	// One context for the lifetime of this invocation. SIGINT/SIGTERM cancel it,
+	// which propagates to any in-flight install or eval that accepts a ctx.
+	// The SIGINT expansion is a future seam — callers that manufacture their own
+	// context.Background() internally defeat cancellation for those calls.
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
 	cmd := args[0]
 	rest := args[1:]
 
@@ -95,9 +102,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "inventory":
 		return runInventory(rest, stdout, stderr)
 	case "eval":
-		return runEval(rest, stdout, stderr, os.Stdin)
+		return runEval(ctx, rest, stdout, stderr, os.Stdin)
 	case "install":
-		return runInstall(rest, stdout, stderr)
+		return runInstall(ctx, rest, stdout, stderr)
 	case "tools":
 		return runTools(rest, stdout, stderr, os.Stdin)
 	case "iterm-install":

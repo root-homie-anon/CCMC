@@ -1082,7 +1082,7 @@ func TestRun_InventoryUnknownSubcommand(t *testing.T) {
 func runEvalCmd(args []string, stdinInput string) (stdout, stderr string, code int) {
 	var outBuf, errBuf bytes.Buffer
 	stdinReader := strings.NewReader(stdinInput)
-	code = runEval(args, &outBuf, &errBuf, stdinReader)
+	code = runEval(context.Background(), args, &outBuf, &errBuf, stdinReader)
 	return outBuf.String(), errBuf.String(), code
 }
 
@@ -1198,6 +1198,84 @@ func TestRun_EvalAcceptInstall(t *testing.T) {
 	}
 }
 
+// TestRun_EvalInstallUsesCanonicalURL verifies NF-2: when the user answers "y"
+// to the eval install prompt, installFunc receives a canonical
+// "https://github.com/owner/repo" URL derived from the parsed owner/repo — not
+// the raw input string. This ensures C-2 canonicalization is enforced on the
+// eval→install path.
+func TestRun_EvalInstallUsesCanonicalURL(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+
+	origFetch := ghFetchFunc
+	origEval := evalFunc
+	origInstall := installFunc
+	t.Cleanup(func() { ghFetchFunc = origFetch; evalFunc = origEval; installFunc = origInstall })
+
+	ghFetchFunc = func(_ context.Context, _, _ string) (ccmc.EvalContext, error) {
+		return ccmc.EvalContext{Owner: "myowner", Repo: "myrepo"}, nil
+	}
+	evalFunc = func(_ context.Context, _ string, _ ccmc.EvalContext, _ string) (ccmc.EvalResult, error) {
+		return ccmc.EvalResult{Recommendation: "install"}, nil
+	}
+
+	var capturedURL string
+	installFunc = func(_ context.Context, _ config.Config, src integrator.InstallSource) (ccmc.InstallResult, error) {
+		capturedURL = src.URL
+		return ccmc.InstallResult{Name: "myrepo", Type: "stdio", Scope: "global"}, nil
+	}
+
+	// Supply a URL with trailing slash to confirm the canonical form strips it.
+	_, errOut, code := runEvalCmd([]string{"https://github.com/myowner/myrepo/"}, "y\n")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
+	}
+	wantURL := "https://github.com/myowner/myrepo"
+	if capturedURL != wantURL {
+		t.Errorf("installFunc received URL %q; want canonical %q", capturedURL, wantURL)
+	}
+}
+
+// TestRun_EvalInstallPromptsBeforeSettingsWrite verifies NF-2: the eval→install
+// path goes through installFromContext, which owns the H-2 gate. Because runEval
+// passes noPrompt=true after the user already confirmed install at the eval
+// stage, the second gate is skipped and installFunc is called directly — this
+// test asserts the install completes (installFunc called) rather than being
+// double-prompted.
+func TestRun_EvalInstallPromptsBeforeSettingsWrite(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+
+	origFetch := ghFetchFunc
+	origEval := evalFunc
+	origInstall := installFunc
+	t.Cleanup(func() { ghFetchFunc = origFetch; evalFunc = origEval; installFunc = origInstall })
+
+	ghFetchFunc = func(_ context.Context, _, _ string) (ccmc.EvalContext, error) {
+		return ccmc.EvalContext{Owner: "myowner", Repo: "myrepo"}, nil
+	}
+	evalFunc = func(_ context.Context, _ string, _ ccmc.EvalContext, _ string) (ccmc.EvalResult, error) {
+		return ccmc.EvalResult{Recommendation: "install"}, nil
+	}
+
+	installerCalled := false
+	installFunc = func(_ context.Context, _ config.Config, _ integrator.InstallSource) (ccmc.InstallResult, error) {
+		installerCalled = true
+		return ccmc.InstallResult{Name: "myrepo", Type: "stdio", Scope: "global"}, nil
+	}
+
+	// Answer "y" to the eval-level Install? prompt — no second prompt should block.
+	_, errOut, code := runEvalCmd([]string{"https://github.com/myowner/myrepo"}, "y\n")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
+	}
+	if !installerCalled {
+		t.Error("expected installFunc to be called on eval→install path")
+	}
+}
+
 // TestRun_EvalNoAPIKey asserts that ErrNoAPIKey from the evaluator exits 1 with
 // a helpful message about keymaster.
 func TestRun_EvalNoAPIKey(t *testing.T) {
@@ -1246,7 +1324,7 @@ func TestRun_InstallHappyPath(t *testing.T) {
 	}
 
 	var outBuf, errBuf bytes.Buffer
-	code := runInstall([]string{"--no-prompt", "--scope", "global", "anthropics/foo"}, &outBuf, &errBuf)
+	code := runInstall(context.Background(), []string{"--no-prompt", "--scope", "global", "anthropics/foo"}, &outBuf, &errBuf)
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errBuf.String())
 	}
@@ -1273,7 +1351,7 @@ func TestRun_InstallAlreadyInstalled(t *testing.T) {
 	}
 
 	var outBuf, errBuf bytes.Buffer
-	code := runInstall([]string{"--no-prompt", "anthropics/foo"}, &outBuf, &errBuf)
+	code := runInstall(context.Background(), []string{"--no-prompt", "anthropics/foo"}, &outBuf, &errBuf)
 	if code != 1 {
 		t.Fatalf("expected exit 1, got %d; stderr: %q", code, errBuf.String())
 	}
@@ -1295,7 +1373,7 @@ func TestRun_InstallRejectsFileURL(t *testing.T) {
 	}
 
 	var outBuf, errBuf bytes.Buffer
-	code := runInstall([]string{"--no-prompt", "file:///etc/passwd"}, &outBuf, &errBuf)
+	code := runInstall(context.Background(), []string{"--no-prompt", "file:///etc/passwd"}, &outBuf, &errBuf)
 	if code != 1 {
 		t.Fatalf("expected exit 1 for file:// URL, got %d; stderr: %q", code, errBuf.String())
 	}
@@ -1316,7 +1394,7 @@ func TestRun_InstallRejectsSSHURL(t *testing.T) {
 	}
 
 	var outBuf, errBuf bytes.Buffer
-	code := runInstall([]string{"--no-prompt", "ssh://git@github.com/owner/repo"}, &outBuf, &errBuf)
+	code := runInstall(context.Background(), []string{"--no-prompt", "ssh://git@github.com/owner/repo"}, &outBuf, &errBuf)
 	if code != 1 {
 		t.Fatalf("expected exit 1 for ssh:// URL, got %d; stderr: %q", code, errBuf.String())
 	}
@@ -1325,11 +1403,11 @@ func TestRun_InstallRejectsSSHURL(t *testing.T) {
 	}
 }
 
-// TestRun_InstallRejectsFlagInjection asserts that URLs that do not parse as
-// valid GitHub https:// references (e.g. bare non-GitHub domains) are rejected
-// before installFunc is called (C-2). The "--" separator in cloneCmd provides
-// defense-in-depth for flag-shaped inputs that survive ParseURL normalization.
-func TestRun_InstallRejectsFlagInjection(t *testing.T) {
+// TestRun_InstallRejectsNonGitHubSSHURL asserts that a non-GitHub ssh:// URL is
+// rejected before installFunc is called (C-2). This was previously (and
+// inaccurately) named TestRun_InstallRejectsFlagInjection; renamed to reflect
+// what it actually tests.
+func TestRun_InstallRejectsNonGitHubSSHURL(t *testing.T) {
 	origInstall := installFunc
 	t.Cleanup(func() { installFunc = origInstall })
 
@@ -1339,14 +1417,8 @@ func TestRun_InstallRejectsFlagInjection(t *testing.T) {
 		return ccmc.InstallResult{}, nil
 	}
 
-	// A bare non-GitHub domain that ParseURL cannot normalize to a github.com URL:
-	// ParseURL("evil.com/owner/repo") → owner="evil.com", repo="owner" → canonical
-	// URL would be https://github.com/evil.com/owner — note this still starts with
-	// https://github.com/. The scheme guard in cloneCmd then rejects it because the
-	// stub is bypassed in tests; instead test with a scheme that ParseURL rejects.
-	// ssh:// causes ParseURL to produce owner="git@evil.com" which is not valid.
 	var outBuf, errBuf bytes.Buffer
-	code := runInstall([]string{"--no-prompt", "ssh://git@evil.com/evil/repo"}, &outBuf, &errBuf)
+	code := runInstall(context.Background(), []string{"--no-prompt", "ssh://git@evil.com/evil/repo"}, &outBuf, &errBuf)
 	if code != 1 {
 		t.Fatalf("expected exit 1 for ssh:// URL, got %d; stderr: %q", code, errBuf.String())
 	}
@@ -1375,7 +1447,7 @@ func TestRun_InstallPromptsBeforeSettingsWrite(t *testing.T) {
 	t.Cleanup(func() { runInstallStdin = origStdin })
 
 	var outBuf, errBuf bytes.Buffer
-	code := runInstallWithReader([]string{"anthropics/foo"}, &outBuf, &errBuf, strings.NewReader("n\n"))
+	code := runInstallWithReader(context.Background(), []string{"anthropics/foo"}, &outBuf, &errBuf, strings.NewReader("n\n"))
 	if code != 0 {
 		t.Fatalf("expected exit 0 for aborted install, got %d; stderr: %q", code, errBuf.String())
 	}

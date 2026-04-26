@@ -207,7 +207,7 @@ type PluginEntry struct {
 // InstallResult is the structured output from the tool installer.
 type InstallResult struct {
 	Name      string `json:"name"`      // Resolved tool name (repo basename or frontmatter)
-	Type      string `json:"type"`      // "mcp-stdio" | "mcp-sse" | "skill" | "agent" | "plugin"
+	Type      string `json:"type"`      // "stdio" | "sse" | "skill" | "agent" | "plugin"
 	SourceURL string `json:"sourceUrl"` // Original GitHub URL passed by the caller
 	Scope     string `json:"scope"`     // "global" or absolute project path
 	ClonePath string `json:"clonePath"` // Absolute path to cloned repo; empty for non-clone types

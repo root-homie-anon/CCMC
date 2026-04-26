@@ -151,10 +151,15 @@ func (m *Manager) Remove(name string, deleteClone bool) error {
 }
 
 // gitPullCmd is a package-level variable so tests can stub the git invocation
-// without spawning a real process. The "--" separator prevents git from
-// misinterpreting a path as a flag (C-2/M-2 defense-in-depth).
+// without spawning a real process.
+//
+// Do NOT insert "--" between "-C" and clonePath: git -C consumes the very next
+// token as the chdir target, so "-C" "--" would chdir into a directory named
+// "--" and leave clonePath and "pull" as unrecognized positional args. The
+// clone-path prefix guard at M-2 (Update method) already ensures clonePath
+// cannot be attacker-controlled, so "--" is unnecessary here.
 var gitPullCmd = func(clonePath string) *exec.Cmd {
-	return exec.Command("git", "-C", "--", clonePath, "pull")
+	return exec.Command("git", "-C", clonePath, "pull")
 }
 
 // Update runs git pull in the clone directory for the named tool. It is a no-op
