@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -724,17 +723,12 @@ func TestInstall_C1RoundTrip(t *testing.T) {
 // produces a non-github.com URL (e.g. from an ssh:// input), cloneCmd must
 // reject it without spawning a process.
 func TestCloneCmd_RejectsFlagInjection(t *testing.T) {
-	origClone := cloneCmd
-	t.Cleanup(func() { cloneCmd = origClone })
-
-	// Restore the real cloneCmd (not stubbed) so we exercise the actual guard.
-	cloneCmd = func(ctx context.Context, url, dest string) error {
-		if !strings.HasPrefix(url, "https://github.com/") {
-			return fmt.Errorf("cloneCmd: URL %q is not an allowed GitHub HTTPS URL", url)
-		}
-		// In a real test we would shell out; for unit coverage we only test the guard.
-		return nil
-	}
+	// N-2: save and restore the real seam, then call origCloneCmd directly so a
+	// future regression that removes the guard from installer.go:cloneCmd is caught.
+	// Previously this test re-implemented the prefix check inline, meaning the real
+	// guard could be deleted without failing the test.
+	origCloneCmd := cloneCmd
+	t.Cleanup(func() { cloneCmd = origCloneCmd })
 
 	cases := []struct {
 		name string
@@ -747,7 +741,9 @@ func TestCloneCmd_RejectsFlagInjection(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := cloneCmd(context.Background(), tc.url, t.TempDir())
+			// Call origCloneCmd (the real seam) directly — not cloneCmd, which tests
+			// may have replaced. This is the seam whose guard we are testing.
+			err := origCloneCmd(context.Background(), tc.url, t.TempDir())
 			if err == nil {
 				t.Errorf("cloneCmd(%q): expected rejection, got nil", tc.url)
 			}

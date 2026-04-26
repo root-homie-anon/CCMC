@@ -1164,8 +1164,9 @@ func TestRun_EvalNoPrompt(t *testing.T) {
 	}
 }
 
-// TestRun_EvalAcceptInstall supplies "y" to the prompt and asserts the installer
-// seam is invoked.
+// TestRun_EvalAcceptInstall supplies "y" to both prompts and asserts the
+// installer seam is invoked. Two prompts fire: the eval-time accept and the H-2
+// settings.json mutation confirmation.
 func TestRun_EvalAcceptInstall(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("CCMC_DIR", tmp)
@@ -1189,12 +1190,13 @@ func TestRun_EvalAcceptInstall(t *testing.T) {
 		return ccmc.InstallResult{Name: "foo", Type: "mcp-stdio", Scope: "global"}, nil
 	}
 
-	_, errOut, code := runEvalCmd([]string{"anthropics/foo"}, "y\n")
+	// "y\ny\n": first y = eval-time accept; second y = H-2 settings.json consent.
+	_, errOut, code := runEvalCmd([]string{"anthropics/foo"}, "y\ny\n")
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
 	}
 	if !installerCalled {
-		t.Error("expected installer to be called when user answers y")
+		t.Error("expected installer to be called when user answers y to both prompts")
 	}
 }
 
@@ -1227,7 +1229,8 @@ func TestRun_EvalInstallUsesCanonicalURL(t *testing.T) {
 	}
 
 	// Supply a URL with trailing slash to confirm the canonical form strips it.
-	_, errOut, code := runEvalCmd([]string{"https://github.com/myowner/myrepo/"}, "y\n")
+	// Two prompts fire: eval-time accept and H-2. Supply "y\ny\n" for both.
+	_, errOut, code := runEvalCmd([]string{"https://github.com/myowner/myrepo/"}, "y\ny\n")
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
 	}
@@ -1237,12 +1240,14 @@ func TestRun_EvalInstallUsesCanonicalURL(t *testing.T) {
 	}
 }
 
-// TestRun_EvalInstallPromptsBeforeSettingsWrite verifies NF-2: the eval→install
-// path goes through installFromContext, which owns the H-2 gate. Because runEval
-// passes noPrompt=true after the user already confirmed install at the eval
-// stage, the second gate is skipped and installFunc is called directly — this
-// test asserts the install completes (installFunc called) rather than being
-// double-prompted.
+// TestRun_EvalInstallPromptsBeforeSettingsWrite verifies N-1 / H-2 contract:
+// the eval→install path fires TWO prompts that confirm DIFFERENT things:
+//  1. "Install? [y/N]" — consent to install the tool at all (eval-time).
+//  2. H-2 prompt inside installFromContext — consent to the exact command line
+//     that will be written to settings.json.
+//
+// The user must answer "y" to both for installFunc to be called. Answering "n"
+// to the H-2 prompt aborts without writing settings.json.
 func TestRun_EvalInstallPromptsBeforeSettingsWrite(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("CCMC_DIR", tmp)
@@ -1266,13 +1271,92 @@ func TestRun_EvalInstallPromptsBeforeSettingsWrite(t *testing.T) {
 		return ccmc.InstallResult{Name: "myrepo", Type: "stdio", Scope: "global"}, nil
 	}
 
-	// Answer "y" to the eval-level Install? prompt — no second prompt should block.
-	_, errOut, code := runEvalCmd([]string{"https://github.com/myowner/myrepo"}, "y\n")
+	// Supply "y\ny\n": first "y" answers "Install? [y/N]" (eval consent);
+	// second "y" answers the H-2 prompt (settings.json mutation consent).
+	_, errOut, code := runEvalCmd([]string{"https://github.com/myowner/myrepo"}, "y\ny\n")
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
 	}
 	if !installerCalled {
-		t.Error("expected installFunc to be called on eval→install path")
+		t.Error("expected installFunc to be called after both prompts answered y")
+	}
+}
+
+// TestRun_EvalInstallH2AbortOnNo verifies N-1 / H-2 contract: answering "n" to
+// the H-2 prompt (the settings.json mutation confirmation) aborts the install
+// without calling installFunc, even after "y" to the eval-time accept.
+func TestRun_EvalInstallH2AbortOnNo(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+
+	origFetch := ghFetchFunc
+	origEval := evalFunc
+	origInstall := installFunc
+	t.Cleanup(func() { ghFetchFunc = origFetch; evalFunc = origEval; installFunc = origInstall })
+
+	ghFetchFunc = func(_ context.Context, _, _ string) (ccmc.EvalContext, error) {
+		return ccmc.EvalContext{Owner: "myowner", Repo: "myrepo"}, nil
+	}
+	evalFunc = func(_ context.Context, _ string, _ ccmc.EvalContext, _ string) (ccmc.EvalResult, error) {
+		return ccmc.EvalResult{Recommendation: "install"}, nil
+	}
+
+	installerCalled := false
+	installFunc = func(_ context.Context, _ config.Config, _ integrator.InstallSource) (ccmc.InstallResult, error) {
+		installerCalled = true
+		return ccmc.InstallResult{}, nil
+	}
+
+	// "y" to eval accept; "n" to H-2 — install must be aborted.
+	_, errOut, code := runEvalCmd([]string{"https://github.com/myowner/myrepo"}, "y\nn\n")
+	if code != 0 {
+		t.Fatalf("expected exit 0 (aborted cleanly), got %d; stderr: %q", code, errOut)
+	}
+	if installerCalled {
+		t.Error("installFunc must NOT be called when user answers n to H-2 prompt")
+	}
+}
+
+// TestRun_EvalInstallNoPromptForce verifies N-1: when --force is passed to eval,
+// only ONE prompt fires — the eval-time "Install? [y/N]". The H-2 prompt inside
+// installFromContext is skipped because force=true, meaning the user has
+// explicitly opted out of all confirmation gates.
+func TestRun_EvalInstallNoPromptForce(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+	t.Setenv("CLAUDE_CONFIG_DIR", tmp)
+
+	origFetch := ghFetchFunc
+	origEval := evalFunc
+	origInstall := installFunc
+	t.Cleanup(func() { ghFetchFunc = origFetch; evalFunc = origEval; installFunc = origInstall })
+
+	ghFetchFunc = func(_ context.Context, _, _ string) (ccmc.EvalContext, error) {
+		return ccmc.EvalContext{Owner: "myowner", Repo: "myrepo"}, nil
+	}
+	evalFunc = func(_ context.Context, _ string, _ ccmc.EvalContext, _ string) (ccmc.EvalResult, error) {
+		return ccmc.EvalResult{Recommendation: "install"}, nil
+	}
+
+	installerCalled := false
+	installFunc = func(_ context.Context, _ config.Config, src integrator.InstallSource) (ccmc.InstallResult, error) {
+		installerCalled = true
+		if !src.Force {
+			t.Error("installFunc: expected src.Force=true when --force passed to eval")
+		}
+		return ccmc.InstallResult{Name: "myrepo", Type: "stdio", Scope: "global"}, nil
+	}
+
+	// Only ONE prompt fires with --force: the eval-time accept. Supply only one
+	// "y\n". If H-2 were firing, the second prompt would block waiting on stdin
+	// (EOF → no input → "aborted" → installFunc not called → test fails).
+	_, errOut, code := runEvalCmd([]string{"--force", "https://github.com/myowner/myrepo"}, "y\n")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %q", code, errOut)
+	}
+	if !installerCalled {
+		t.Error("expected installFunc to be called after single eval-time prompt with --force")
 	}
 }
 
@@ -1456,6 +1540,42 @@ func TestRun_InstallPromptsBeforeSettingsWrite(t *testing.T) {
 	}
 	if !strings.Contains(outBuf.String(), "aborted") {
 		t.Errorf("expected 'aborted' in output; got: %q", outBuf.String())
+	}
+}
+
+// TestInstallFromContext_RejectsRawNonGitHubURL verifies N-4: installFromContext
+// defensively re-validates src.URL via ParseURL regardless of caller. A raw
+// non-GitHub URL (e.g. file://, ssh://) passed directly must be rejected before
+// reaching git clone, protecting against any future caller that skips the
+// ParseURL step that runInstall and runEval perform.
+func TestInstallFromContext_RejectsRawNonGitHubURL(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("CCMC_DIR", tmp)
+
+	origInstall := installFunc
+	t.Cleanup(func() { installFunc = origInstall })
+
+	installerCalled := false
+	installFunc = func(_ context.Context, _ config.Config, _ integrator.InstallSource) (ccmc.InstallResult, error) {
+		installerCalled = true
+		return ccmc.InstallResult{}, nil
+	}
+
+	cfg := config.Config{}
+	src := integrator.InstallSource{
+		URL:   "file:///tmp/evil",
+		Scope: "global",
+	}
+	var outBuf, errBuf bytes.Buffer
+	code := installFromContext(context.Background(), cfg, src, false, true /*noPrompt*/, nil, &outBuf, &errBuf)
+	if code == 0 {
+		t.Fatal("expected non-zero exit for invalid URL, got 0")
+	}
+	if installerCalled {
+		t.Error("installFunc must not be called when URL is invalid")
+	}
+	if !strings.Contains(errBuf.String(), "invalid URL") {
+		t.Errorf("expected 'invalid URL' in stderr; got: %q", errBuf.String())
 	}
 }
 

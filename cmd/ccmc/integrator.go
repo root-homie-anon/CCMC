@@ -155,6 +155,10 @@ func runEval(ctx context.Context, args []string, stdout, stderr io.Writer, stdin
 
 	// Prompt the user.
 	fmt.Fprintf(stdout, "\nInstall? [y/N] ")
+	// Use a single bufio.Reader for all stdin reads in this function so that
+	// any bytes buffered-but-not-yet-consumed are available to installFromContext.
+	// Passing raw stdin after a bufio.NewReader has already buffered bytes from it
+	// would cause those bytes to be invisible to a second bufio.NewReader.
 	reader := bufio.NewReader(stdin)
 	answer, _ := reader.ReadString('\n')
 	answer = strings.TrimSpace(answer)
@@ -171,10 +175,19 @@ func runEval(ctx context.Context, args []string, stdout, stderr io.Writer, stdin
 			Scope:   scope,
 			Force:   force,
 		}
-		// Route through installFromContext so H-2 is enforced consistently.
-		// The eval-time "Install? [y/N]" prompt already answered — pass --no-prompt
-		// equivalent (noPrompt=true) so installFromContext skips a second prompt.
-		return installFromContext(ctx, cfg, src, force, true /*noPrompt*/, stdin, stdout, stderr)
+		// Two-prompt sequence — they confirm DIFFERENT things:
+		//   1. "Install? [y/N]" above: consent to install this tool at all.
+		//   2. H-2 prompt inside installFromContext: consent to THIS EXACT command
+		//      line (resolved command + args) being written to settings.json.
+		// The second prompt is the H-2 contract; skipping it hides the settings.json
+		// mutation from the user. Pass noPrompt=false so H-2 always fires on the
+		// eval→install path.
+		// Exception: if --force was supplied to eval, the user has explicitly opted
+		// out of confirmation gates — plumb force through so H-2 is skipped.
+		//
+		// Pass reader (the bufio.Reader that consumed the first prompt's answer) so
+		// installFromContext sees the remaining buffered bytes for the H-2 answer.
+		return installFromContext(ctx, cfg, src, force, false /*noPrompt*/, reader, stdout, stderr)
 	}
 
 	return 0
@@ -330,7 +343,21 @@ func runInstallWithReader(ctx context.Context, args []string, stdout, stderr io.
 // NF-2: runEval must go through this helper so the H-2 prompt is always reached
 // on the eval→install path. Bypassing it (calling doInstall directly with the
 // raw eval URL) would defeat C-2 re-canonicalization and skip the H-2 gate.
+//
+// N-4: defensively re-validates src.URL via ParseURL regardless of caller. Both
+// current callers canonicalize before calling this helper, making this a no-op
+// for them. The guard exists so any future caller that passes a raw URL is
+// rejected here rather than silently bypassing C-2 and reaching git clone.
 func installFromContext(ctx context.Context, cfg config.Config, src integrator.InstallSource, force, noPrompt bool, stdin io.Reader, stdout, stderr io.Writer) int {
+	// N-4: defensive re-canonicalization. If src.URL is already canonical
+	// (https://github.com/owner/repo) this is a no-op. Any other form is rejected.
+	owner, repo, err := integrator.ParseURL(src.URL)
+	if err != nil {
+		fmt.Fprintf(stderr, "installFromContext: invalid URL %q: %v\n", src.URL, err)
+		return 1
+	}
+	src.URL = fmt.Sprintf("https://github.com/%s/%s", owner, repo)
+
 	// H-2: confirmation gate before settings.json is mutated.
 	// Skipped when --force or --no-prompt is set.
 	if !force && !noPrompt {
