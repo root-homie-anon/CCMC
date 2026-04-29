@@ -38,6 +38,11 @@ var (
 	// target directory in place. The caller should pass --force to remove it and
 	// retry, or run `ccmc tools rm <name>` to clean up manually.
 	ErrStalePartialInstall = errors.New("installer: stale partial install")
+
+	// ErrSymlinkRace is returned when prepareTargetDir detects a symlink at the
+	// target path immediately after RemoveAll — indicating a TOCTOU symlink-redirect
+	// attack. The install is aborted (fail-closed).
+	ErrSymlinkRace = errors.New("installer: symlink detected at target dir after removal — possible TOCTOU attack")
 )
 
 // cloneCmd is a package-level seam that tests replace to avoid real git invocations.
@@ -365,15 +370,12 @@ func (i *Installer) installSkill(ctx context.Context, src InstallSource, toolNam
 	// as the RemoveAll safety boundary so a corrupt targetBase cannot escape ~/.claude/.
 	allowedSkillsBase := filepath.Dir(targetBase)
 
-	// NF-3: if targetBase already exists, a prior install aborted mid-copy. Refuse
-	// (or remove on --force) before invoking copyDir so O_EXCL does not fail on
-	// previously-written files, leaving the install in a perpetually broken state.
+	// NF-3 / TOCTOU: prepareTargetDir removes any stale partial install and then
+	// atomically creates targetBase via a single mkdir(2) syscall. This eliminates
+	// the race window between RemoveAll and the first write. On success, targetBase
+	// exists as a real directory owned by this process — no symlink redirect possible.
 	if err := prepareTargetDir(targetBase, allowedSkillsBase, src.Force); err != nil {
 		return ccmc.InstallResult{}, err
-	}
-
-	if err := os.MkdirAll(targetBase, 0o700); err != nil {
-		return ccmc.InstallResult{}, fmt.Errorf("%w: mkdir target: %v", ErrConfigWriteFailed, err)
 	}
 
 	// Copy the skill dir contents (or the whole repo if no specific skills/ subdir).
@@ -809,28 +811,27 @@ func findAgentFile(cloneDest, toolName string) string {
 	return ""
 }
 
-// prepareTargetDir ensures targetDir is ready for a fresh copyDir. If targetDir
-// exists, it is a stale partial install (O_EXCL in copyFile would fail on any
-// previously-copied file). Behaviour depends on force:
+// prepareTargetDir ensures targetDir is ready for a fresh copyDir and atomically
+// creates it, closing the TOCTOU symlink-redirect window in the --force path.
+//
+// Behaviour when targetDir already exists:
 //   - force=false: return ErrStalePartialInstall with a guidance message so the
 //     user can clean up intentionally (`ccmc tools rm <name>` or --force).
-//   - force=true: remove targetDir entirely, subject to a prefix safety check
-//     (targetDir must begin with allowedBase to prevent RemoveAll on arbitrary
-//     paths).
+//   - force=true: remove targetDir entirely (subject to a prefix safety check),
+//     then atomically create a new real directory at the same path.
+//
+// In all cases the function guarantees that on success:
+//  1. targetDir exists as a real directory (not a symlink).
+//  2. The directory was created by this call via os.Mkdir (atomic mkdir(2)),
+//     eliminating the window between removal and the caller's first write.
+//
+// If a symlink appears at targetDir between RemoveAll and os.Mkdir (the race
+// window), os.Mkdir fails with EEXIST/ENOTDIR and we return ErrSymlinkRace —
+// the install aborts fail-closed rather than writing into the redirect target.
+// A post-Mkdir lstat provides defense-in-depth: if os.Mkdir somehow succeeded
+// through a symlink (impossible on POSIX mkdir(2) but belt-and-suspenders),
+// the lstat check will catch and reject it.
 func prepareTargetDir(targetDir, allowedBase string, force bool) error {
-	if _, err := os.Stat(targetDir); os.IsNotExist(err) {
-		// Nothing there — no action needed.
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("prepareTargetDir: stat %s: %w", targetDir, err)
-	}
-
-	if !force {
-		return fmt.Errorf("%w: stale partial install detected at %s; run `ccmc tools rm <name>` first or re-run with --force",
-			ErrStalePartialInstall, targetDir)
-	}
-
-	// Safety check: targetDir must be under allowedBase.
 	absTarget, err := filepath.Abs(targetDir)
 	if err != nil {
 		return fmt.Errorf("prepareTargetDir: resolve target %s: %w", targetDir, err)
@@ -839,13 +840,68 @@ func prepareTargetDir(targetDir, allowedBase string, force bool) error {
 	if err != nil {
 		return fmt.Errorf("prepareTargetDir: resolve allowed base %s: %w", allowedBase, err)
 	}
-	if !strings.HasPrefix(absTarget, absAllowed+string(filepath.Separator)) && absTarget != absAllowed {
-		return fmt.Errorf("prepareTargetDir: %s is outside allowed base %s — refusing RemoveAll", targetDir, allowedBase)
+
+	// Check whether targetDir currently exists (using Lstat so a symlink is not
+	// followed — we want to know about the symlink itself, not its target).
+	fi, statErr := os.Lstat(absTarget)
+	exists := statErr == nil
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return fmt.Errorf("prepareTargetDir: lstat %s: %w", absTarget, statErr)
 	}
 
-	if err := os.RemoveAll(absTarget); err != nil {
-		return fmt.Errorf("prepareTargetDir: remove stale dir %s: %w", absTarget, err)
+	if exists {
+		if !force {
+			return fmt.Errorf("%w: stale partial install detected at %s; run `ccmc tools rm <name>` first or re-run with --force",
+				ErrStalePartialInstall, absTarget)
+		}
+
+		// Safety check: targetDir must be under allowedBase before RemoveAll.
+		if !strings.HasPrefix(absTarget, absAllowed+string(filepath.Separator)) && absTarget != absAllowed {
+			return fmt.Errorf("prepareTargetDir: %s is outside allowed base %s — refusing RemoveAll", absTarget, absAllowed)
+		}
+
+		// Refuse to RemoveAll a symlink directly — it would remove the link, not its
+		// target, but we still check as an explicit guard.
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("prepareTargetDir: %s is a symlink — refusing RemoveAll", absTarget)
+		}
+
+		if err := os.RemoveAll(absTarget); err != nil {
+			return fmt.Errorf("prepareTargetDir: remove stale dir %s: %w", absTarget, err)
+		}
 	}
+
+	// Ensure the parent directory chain exists. MkdirAll on the parent (not the
+	// target leaf) is safe — we only need single-level atomicity at absTarget.
+	if err := os.MkdirAll(filepath.Dir(absTarget), 0o700); err != nil {
+		return fmt.Errorf("prepareTargetDir: mkdir parent of %s: %w", absTarget, err)
+	}
+
+	// Atomically create the directory. os.Mkdir uses a single mkdir(2) syscall:
+	// it fails with EEXIST if any path (including a symlink) now occupies absTarget,
+	// closing the window between the RemoveAll above and the caller's first write.
+	if err := os.Mkdir(absTarget, 0o700); err != nil {
+		if os.IsExist(err) {
+			// Something appeared in the race window — treat as a symlink-redirect attempt.
+			return fmt.Errorf("%w: path %s", ErrSymlinkRace, absTarget)
+		}
+		return fmt.Errorf("prepareTargetDir: mkdir %s: %w", absTarget, err)
+	}
+
+	// Defense-in-depth: lstat the newly created path and confirm it is a real
+	// directory, not a symlink. POSIX mkdir(2) cannot create through a symlink, but
+	// this check catches any future platform regression or unusual filesystem.
+	postFI, err := os.Lstat(absTarget)
+	if err != nil {
+		return fmt.Errorf("prepareTargetDir: post-mkdir lstat %s: %w", absTarget, err)
+	}
+	if postFI.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: path %s is a symlink after mkdir — aborting", ErrSymlinkRace, absTarget)
+	}
+	if !postFI.IsDir() {
+		return fmt.Errorf("prepareTargetDir: %s is not a directory after mkdir (mode %s) — aborting", absTarget, postFI.Mode())
+	}
+
 	return nil
 }
 

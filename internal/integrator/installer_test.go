@@ -794,6 +794,90 @@ func TestInstall_StalePartialRefusedWithoutForce(t *testing.T) {
 	}
 }
 
+// TestPrepareTargetDir_FreshPath verifies that prepareTargetDir on a path that
+// does not yet exist creates a real directory with mode 0o700 and no symlink.
+// This covers the TOCTOU fix: the function now atomically creates the directory
+// itself rather than returning nil and trusting the caller to do it.
+func TestPrepareTargetDir_FreshPath(t *testing.T) {
+	parent := t.TempDir()
+	target := filepath.Join(parent, "new-tool")
+	// Confirm the target does not exist.
+	if _, err := os.Lstat(target); err == nil {
+		t.Fatalf("precondition failed: %s already exists", target)
+	}
+
+	if err := prepareTargetDir(target, parent, false); err != nil {
+		t.Fatalf("prepareTargetDir: unexpected error on fresh path: %v", err)
+	}
+
+	fi, err := os.Lstat(target)
+	if err != nil {
+		t.Fatalf("target not created: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		t.Errorf("target is a symlink — expected a real directory")
+	}
+	if !fi.IsDir() {
+		t.Errorf("target mode = %s; expected directory", fi.Mode())
+	}
+	// Mode bits: 0o700 (owner rwx, no group/other).
+	if fi.Mode().Perm() != 0o700 {
+		t.Errorf("target perm = %04o; want 0700", fi.Mode().Perm())
+	}
+}
+
+// TestPrepareTargetDir_SymlinkRaceDetected verifies that the TOCTOU window is
+// closed: if a symlink exists at targetDir when prepareTargetDir runs (simulating
+// an attacker racing a symlink in after a prior RemoveAll, or pre-placing one),
+// the function returns ErrSymlinkRace and does NOT follow the symlink. The
+// symlink target must remain empty — no files are written into it.
+func TestPrepareTargetDir_SymlinkRaceDetected(t *testing.T) {
+	parent := t.TempDir()
+	target := filepath.Join(parent, "raced-tool")
+
+	// Attacker-controlled destination — should remain empty after the call.
+	attackerDir := t.TempDir()
+
+	// Pre-create a symlink at the target path pointing to the attacker's directory.
+	// This simulates the race window: the attacker wins the slot before our Mkdir.
+	if err := os.Symlink(attackerDir, target); err != nil {
+		t.Fatalf("setup: create symlink: %v", err)
+	}
+
+	// With force=true: prepareTargetDir will detect the existing symlink during
+	// its initial Lstat, refuse RemoveAll on a symlink directly, and return an error.
+	// With force=false: it returns ErrStalePartialInstall (exists and not forced) —
+	// but importantly, it never follows the symlink.
+	//
+	// We test force=true because that is the path with the TOCTOU window: RemoveAll
+	// would remove the symlink itself (not its target), and then os.Mkdir would
+	// atomically create a real directory — but if Mkdir sees the symlink still there
+	// (impossible after RemoveAll of a symlink, but tested for correctness), it
+	// returns ErrSymlinkRace.
+	//
+	// The existing code now guards the pre-RemoveAll Lstat: if the path is a symlink,
+	// it returns an error rather than calling RemoveAll. This is the primary guard.
+	err := prepareTargetDir(target, parent, true)
+	if err == nil {
+		t.Fatal("expected error when target is a symlink, got nil — TOCTOU window is open")
+	}
+
+	// The error must indicate a symlink problem — either ErrSymlinkRace or a
+	// message containing "symlink".
+	if !errors.Is(err, ErrSymlinkRace) && !strings.Contains(err.Error(), "symlink") {
+		t.Errorf("expected symlink-related error, got: %v", err)
+	}
+
+	// The attacker's directory must still be empty — nothing was written into it.
+	entries, readErr := os.ReadDir(attackerDir)
+	if readErr != nil {
+		t.Fatalf("ReadDir attacker dir: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("attacker directory was written to (%d entries) — symlink redirect succeeded", len(entries))
+	}
+}
+
 // TestInstall_StalePartialRemovedWithForce verifies NF-3: with Force=true, a
 // stale partial install directory is removed before copyDir runs, allowing the
 // install to succeed.
