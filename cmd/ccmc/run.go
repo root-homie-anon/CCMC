@@ -108,8 +108,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "tools":
 		return runTools(rest, stdout, stderr, os.Stdin)
 	case "iterm-install":
-		fmt.Fprintln(stderr, "ccmc iterm-install: not yet implemented")
-		return 2
+		return runItermInstall(ctx, stdout, stderr)
 
 	default:
 		fmt.Fprintf(stderr, "ccmc: unknown command %q\nRun 'ccmc help' for usage.\n", cmd)
